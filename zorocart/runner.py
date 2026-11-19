@@ -96,7 +96,7 @@ class Run:
 
 
 async def execute_run(run: Run, store_url: str, *, headless=False, interactive=False,
-                      timeout=240, max_steps=140, approval=None, profile_dir: Path | None = None):
+                      timeout=420, max_steps=140, approval=None, profile_dir: Path | None = None):
     engine = None
     browser_context = None
     if run.environment == 'coupang' and (approval is None or profile_dir is None):
