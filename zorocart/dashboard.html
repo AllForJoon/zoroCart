@@ -36,7 +36,7 @@
 <div id="confirm" class="notice" hidden><p id="confirm-message"></p><form id="reply-form" class="fields" hidden><input id="reply" aria-label="확인 답변" maxlength="750" required><button type="submit">답변 보내기</button></form><div id="partial-buttons" class="buttons" hidden><button data-answer="yes">이 품목 담기</button><button data-answer="no">취소</button></div></div>
 </section>
 <section class="panel"><h2>진행 상태</h2><div class="status" id="status" role="status">대기 중</div><div id="run-environment" class="subtle" hidden></div><div id="reset-status" class="subtle" aria-live="polite" hidden></div><div id="metrics" class="subtle"></div><ol class="events" id="events" aria-label="최근 진행"></ol></section>
-<section class="panel"><h2>이번 실행에서 확인한 장바구니</h2><div id="result" class="empty">실행이 끝나면 추가된 상품과 수량이 표시됩니다.</div><p id="demo-cart-link"><a href="/store/cart" target="_blank" rel="noopener" style="color:var(--green)">시연 장바구니 보기</a></p></section>
+<section class="panel"><h2 id="outcome-heading">이번 실행에서 확인한 장바구니</h2><div id="result" class="empty">실행이 끝나면 추가된 상품과 수량이 표시됩니다.</div><p id="demo-cart-link"><a href="/store/cart" target="_blank" rel="noopener" style="color:var(--green)">시연 장바구니 보기</a></p></section>
 <section class="panel"><h2>후보 점수</h2><div class="table-wrap"><table class="candidate-table"><thead><tr><th scope="col">상품과 옵션</th><th scope="col">점수</th><th scope="col">판단</th></tr></thead><tbody id="candidates"></tbody></table><p id="no-candidates" class="empty">상세 화면에서 확인한 후보가 여기에 표시됩니다.</p></div></section>
 </div></main>
 <script>
@@ -47,8 +47,8 @@ const browserName=document.querySelector('meta[name=zc-browser]').content;
 let runId=null;
 let coupangAvailable=false;
 let coupangWritesAvailable=false;
-const statusNames={complete:'장바구니 검증 완료',partial:'일부 품목 검증 완료',held:'담기 보류',error:'실행 오류'};
-const titles={shopping_plan:'구매 계획 확정',cart_reset_started:'기존 장바구니 확인',cart_reset_verified:'빈 장바구니 확인',cart_reset_incomplete:'장바구니 초기화 보류',search_query:'검색어 생성',browser_action:'브라우저',cart_baseline:'담기 전 빈 장바구니 확인',cart_verification:'장바구니 수량 대조',add_uncertain:'담기 응답 확인 중',stale_observation:'화면 변경 후 재관찰',choice_recheck:'상품 근거 재확인',held:'담기 보류'};
+const statusNames={complete:'장바구니 검증 완료',partial:'일부 품목 검증 완료',search_verified:'검색 확인 완료',held:'담기 보류',error:'실행 오류'};
+const titles={shopping_plan:'구매 계획 확정',cart_reset_started:'기존 장바구니 확인',cart_reset_verified:'빈 장바구니 확인',cart_reset_incomplete:'장바구니 초기화 보류',search_query:'검색어 생성',search_results_visible:'검색 화면 확인',browser_action:'브라우저',cart_baseline:'담기 전 빈 장바구니 확인',cart_verification:'장바구니 수량 대조',add_uncertain:'담기 응답 확인 중',stale_observation:'화면 변경 후 재관찰',choice_recheck:'상품 근거 재확인',held:'실행 보류'};
 const add=(parent,tag,content,className)=>{const node=document.createElement(tag);node.textContent=content;if(className)node.className=className;parent.append(node);return node;};
 const won=n=>new Intl.NumberFormat('ko-KR').format(n)+'원';
 async function api(path, method='GET', body){const options={method,headers:{'X-ZoroCart-Token':token}};if(body){options.headers['Content-Type']='application/json';options.body=JSON.stringify(body);}const response=await fetch(path,options);if(!response.ok){const error=await response.json();throw new Error(typeof error.detail==='string'?error.detail:'요청에 실패했습니다.');}return response.json();}
@@ -58,7 +58,7 @@ function showEnvironment(){
  $('environment-badge').textContent=live?'쿠팡 실사이트 · 비로그인':'로컬 시연 · 합성 상품 · 실제 Zoro-1';
  $('environment-note').hidden=coupangAvailable&&(!live||coupangWritesAvailable);
  $('environment-note').textContent=coupangAvailable?'비로그인 장바구니의 삭제·담기 경로 확인이 필요합니다.':'쿠팡 실사이트는 승인 범위와 전용 Chromium 프로필을 설정하면 열립니다.';
- $('reset-policy').textContent=live?(coupangWritesAvailable?`${browserName}의 비로그인 장바구니를 비운 뒤 새 상품을 찾아 담습니다.`:`${browserName}에서 비로그인 접속을 확인합니다.`):'요청이 확정되면 기존 시연 장바구니를 비운 뒤 새 상품을 찾아 담습니다.';
+ $('reset-policy').textContent=live?(coupangWritesAvailable?`${browserName}의 비로그인 장바구니를 비운 뒤 새 상품을 찾아 담습니다.`:`${browserName}에서 비로그인 검색 화면을 확인합니다.`):'요청이 확정되면 기존 시연 장바구니를 비운 뒤 새 상품을 찾아 담습니다.';
  $('run-button').textContent=live?(coupangWritesAvailable?'쿠팡 장바구니 비우고 시작':'쿠팡 비로그인 접속 확인'):'장바구니 비우고 시작';
  $('demo-cart-link').hidden=live;
 }
@@ -67,7 +67,9 @@ function running(value){
 }
 function render(data){
  const {result,events,metrics,pending,environment}=data;
- $('status').textContent=result?statusNames[result.status]:pending?'사용자 확인 대기 중':'실행 중';
+ const searchOnly=environment==='coupang'&&!coupangWritesAvailable;
+ $('outcome-heading').textContent=searchOnly?'쿠팡 검색 결과':'이번 실행에서 확인한 장바구니';
+ $('status').textContent=result?(searchOnly&&result.status==='held'?'조회 보류':statusNames[result.status]):pending?'사용자 확인 대기 중':'실행 중';
  $('run-environment').hidden=false;
  $('run-environment').textContent=environment==='coupang'?'쿠팡 실사이트 · 비로그인':'로컬 시연 실행';
  const reset=events.find(e=>e.kind==='cart_reset_verified');
@@ -85,6 +87,12 @@ function render(data){
  $('confirm').hidden=!pending;$('reply-form').hidden=pending?.type!=='clarification';$('partial-buttons').hidden=pending?.type!=='partial';$('confirm-message').textContent=pending?.message||'';
  if(!result)return;
  const display=$('result');display.replaceChildren();display.className='';
+ if(searchOnly){
+   const searches=events.filter(e=>e.kind==='search_results_visible');
+   if(searches.length){const list=add(display,'ul','','rows');for(const e of searches)add(list,'li',`‘${e.query}’ 검색 화면을 열고 상품 카드 ${e.inspected_cards}개를 읽었습니다.`);}
+   if(result.reason)add(display,'p',result.reason,'notice');
+   running(false);return;
+ }
  add(display,'div',won(result.merchandise_total),'money');add(display,'div','추가된 상품의 상품가 합계','subtle');
  const rows=add(display,'ul','','rows');
  for(const line of result.added){const row=add(rows,'li','');add(row,'strong',line.title);add(row,'div',`${line.option} · 주문 ${line.quantity}개 · 단위당 구성 ${line.pack_count} · ${won(line.merchandise_total)}${line.delivery?' · '+line.delivery:''}`,'subtle');if(line.verified_attributes?.length)add(row,'small',line.verified_attributes.join(' · '));}
@@ -93,7 +101,7 @@ function render(data){
  running(false);
 }
 async function poll(){try{const data=await api('/api/runs/'+runId);render(data);if(!data.result)setTimeout(poll,800);}catch(error){$('status').textContent=error.message;running(false);}}
-$('request-form').addEventListener('submit',async event=>{event.preventDefault();const environment=$('environment').value;running(true);$('status').textContent='실행 준비 중';try{const response=await api('/api/runs','POST',{request:$('request').value,environment});runId=response.id;$('reset-status').hidden=true;$('reset-status').textContent='';$('result').textContent='장바구니를 확인할 때까지 기다려 주세요.';poll();}catch(error){$('status').textContent=error.message;running(false);}});
+$('request-form').addEventListener('submit',async event=>{event.preventDefault();const environment=$('environment').value;running(true);$('status').textContent='실행 준비 중';try{const response=await api('/api/runs','POST',{request:$('request').value,environment});runId=response.id;$('reset-status').hidden=true;$('reset-status').textContent='';const searchOnly=environment==='coupang'&&!coupangWritesAvailable;$('result').textContent=searchOnly?'상품 검색 화면을 확인하고 있습니다.':'장바구니를 확인할 때까지 기다려 주세요.';poll();}catch(error){$('status').textContent=error.message;running(false);}});
 async function reply(answer){try{await api('/api/runs/'+runId+'/reply','POST',{answer});$('confirm').hidden=true;$('reply').value='';}catch(error){$('confirm-message').textContent=error.message;}}
 $('reply-form').addEventListener('submit',event=>{event.preventDefault();reply($('reply').value);});
 $('partial-buttons').addEventListener('click',event=>{if(event.target.dataset.answer)reply(event.target.dataset.answer);});

@@ -7,7 +7,7 @@ from math import ceil
 import re
 from typing import Any, Awaitable, Callable
 
-from .browser import AmbiguousAdd, AmbiguousClear, BrowserAdapter, BrowserError, CartLine, StaleObservation
+from .browser import AmbiguousAdd, AmbiguousClear, BrowserAdapter, BrowserError, CartLine, StaleObservation, Target
 from .model import ModelError, ZoroClient
 from .planning import ShoppingItem, ShoppingPlan, generate_search_query, plan_purchase
 
@@ -91,12 +91,14 @@ def feasible(plan: ShoppingPlan, groups: list[list[Candidate]], spent: int = 0) 
 class ShoppingEngine:
     def __init__(self, client: ZoroClient, browser: BrowserAdapter, event: Callable, *,
                  score_threshold: float = 2.5, choice_threshold: float = 0.70,
-                 confirm: Callable[[str, str], Awaitable[str | None]] | None = None):
+                 confirm: Callable[[str, str], Awaitable[str | None]] | None = None,
+                 search_only: bool = False):
         if not 0 <= score_threshold <= 4 or not 0 <= choice_threshold <= 1:
             raise ValueError('상품 점수 임계값은 0~4, 선택 확률 임계값은 0~1이어야 합니다.')
         self.client, self.browser, self.event = client, browser, event
         self.score_threshold, self.choice_threshold = score_threshold, choice_threshold
         self.confirm = confirm
+        self.search_only = search_only
         self.cart_reset: dict | None = None
         self.previous: dict[str, Any] | None = None
         self.selections: dict[tuple, Candidate] = {}
@@ -178,7 +180,7 @@ class ShoppingEngine:
         self.cart_reset.update(status='verified', **removed)
         self.event('cart_reset_verified', **removed)
 
-    async def search(self, item: ShoppingItem, previous_query: str | None = None) -> tuple[str, list[Candidate]]:
+    async def open_search(self, item: ShoppingItem, previous_query: str | None = None) -> tuple[str, list[Target]]:
         await self.browser.open_home()
         async def query_after_decision():
             nonlocal query
@@ -190,7 +192,12 @@ class ShoppingEngine:
         await self.step('search-input', '품목 검색어 입력', value_factory=query_after_decision)
         await self.step('search-submit', '현재 검색어로 상품 검색')
         observation = await self.browser.observe()
-        cards = [t for t in observation.targets if t.role == 'card'][:6]
+        if observation.view != 'results':
+            raise Hold('상품 검색 결과 화면을 확인할 수 없습니다.')
+        return query, [target for target in observation.targets if target.role == 'card'][:6]
+
+    async def search(self, item: ShoppingItem, previous_query: str | None = None) -> tuple[str, list[Candidate]]:
+        query, cards = await self.open_search(item, previous_query)
         if not cards:
             self.event('candidate_hold', item=item.id, reason='검색 결과 없음')
             return query, []
@@ -425,6 +432,17 @@ class ShoppingEngine:
             if not self.items:
                 raise Hold('구매할 품목이 확인되지 않았습니다.')
             self.event('shopping_plan', plan=self.plan.model_dump())
+            if self.search_only:
+                for item in self.items:
+                    self.item = item
+                    query, cards = await self.open_search(item)
+                    if not cards:
+                        query, cards = await self.open_search(item, query)
+                    if not cards:
+                        raise Hold(f'{item.name}의 검색 결과에서 상품 카드를 확인할 수 없습니다.')
+                    self.event('search_results_visible', item=item.name, query=query,
+                               inspected_cards=len(cards))
+                return self.result('search_verified')
             await self.reset_cart()
             groups = []
             for item in self.items:

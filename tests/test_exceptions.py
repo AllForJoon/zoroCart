@@ -135,7 +135,7 @@ async def running_store():
             await task
 
 
-async def exercise(fault: str, *, confirmation=None, draft=PLAN):
+async def exercise(fault: str, *, confirmation=None, draft=PLAN, search_only: bool = False):
     run = Run(SCENARIOS["household"], environment="offline-test")
     async with running_store() as (origin, writes), async_playwright() as pw:
         async def confirm(kind: str, message: str):
@@ -154,6 +154,7 @@ async def exercise(fault: str, *, confirmation=None, draft=PLAN):
                 engine = ShoppingEngine(
                     model, adapter, run.event,
                     confirm=confirm if confirmation is not None else None,
+                    search_only=search_only,
                 )
                 try:
                     result = await engine.run(run.request)
@@ -170,6 +171,35 @@ async def exercise(fault: str, *, confirmation=None, draft=PLAN):
                 }
             await context.close()
     return result, run.events, cart, writes
+
+
+def test_search_only_verifies_both_result_views_without_changing_cart():
+    result, events, cart, writes = asyncio.run(exercise("", search_only=True))
+
+    assert result["status"] == "search_verified"
+    assert result["cart_reset"] is None
+    assert not result["added"]
+    assert not writes
+    assert cart == BASELINE
+
+    searched = [event for event in events if event["kind"] == "search_results_visible"]
+    assert [(event["item"], event["query"]) for event in searched] == [
+        ("물티슈", "무향 물티슈"),
+        ("쓰레기봉투", "30L 손잡이형 쓰레기봉투"),
+    ]
+    assert all(event["inspected_cards"] > 0 for event in searched)
+
+
+def test_search_only_holds_when_both_queries_lack_readable_cards(monkeypatch):
+    monkeypatch.setitem(QUERIES, "물티슈", ("없는 상품", "없는 물건"))
+    result, events, cart, writes = asyncio.run(exercise("", search_only=True))
+
+    assert result["status"] == "held"
+    assert "상품 카드" in result["reason"]
+    assert [event["retry"] for event in events if event["kind"] == "search_query"] == [False, True]
+    assert not any(event["kind"] == "search_results_visible" for event in events)
+    assert not writes
+    assert cart == BASELINE
 
 
 @pytest.mark.parametrize(("fault", "reason"), [

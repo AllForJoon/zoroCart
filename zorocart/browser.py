@@ -10,7 +10,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from urllib.parse import parse_qsl, urljoin, urlsplit
 
-from playwright.async_api import ElementHandle, Error as PlaywrightError, Page, Route
+from playwright.async_api import ElementHandle, Error as PlaywrightError, Page, Request, Route
 
 from .coupang_evidence import parse_pack, parse_price, parse_quantity
 
@@ -302,6 +302,10 @@ class CoupangApproval:
     @property
     def can_write(self) -> bool:
         return self.can_add and self.can_clear
+
+    @property
+    def native_read_only(self) -> bool:
+        return self.desktop_ui and not (self.can_add or self.can_clear)
 
     def read_scopes(self) -> dict[tuple[str, str | None, int | None], tuple[str, ...]]:
         home = _origin(urlsplit(self.home_url))
@@ -662,7 +666,7 @@ class BrowserAdapter:
             else:
                 await route.abort()
         else:
-            if request.is_navigation_request():
+            if self._is_main_navigation(request):
                 self._network_blocked = True
             await route.abort()
 
@@ -718,8 +722,18 @@ class BrowserAdapter:
             self.page.on("response", self._on_response)
             self._routing = True
 
+    def _is_main_navigation(self, request: Request) -> bool:
+        if not request.is_navigation_request():
+            return False
+        try:
+            return request.frame == self.page.main_frame
+        except PlaywrightError:
+            # A frame may not be available for a newly issued navigation.
+            # The request can still be denied without assigning a page blocker.
+            return False
+
     def _on_response(self, response) -> None:
-        if response.status in _ACCESS_REASON and response.request.is_navigation_request():
+        if response.status in _ACCESS_REASON and self._is_main_navigation(response.request):
             self._network_blocked = True
             self._blocked_status = response.status
 

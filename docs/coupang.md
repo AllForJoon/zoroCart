@@ -10,6 +10,8 @@ ZOROCART_CHROMIUM_CHANNEL=chrome python -m zorocart serve --port 8887 \
 
 대시보드에서 **쿠팡 실사이트 · 비로그인**을 선택한다. 데스크톱 승인 파일에는 `desktop_ui`를 `true`로 설정한다. 동일한 전용 프로필을 사용하는 다음 요청은 같은 비회원 장바구니에서 시작한다. 비회원 화면에서 삭제와 담기 요청 형식을 모두 확인하기 전에는 대시보드에 **쿠팡 비로그인 접속 확인**이 표시된다.
 
+변경 경로가 모두 비어 있는 접속 확인 모드는 Chrome의 기본 네트워크 동작을 사용한다. 승인된 화면의 조회 전용 검색 양식을 이용해 각 품목의 검색 결과를 확인한다. 장바구니 작업에 사용하는 프로필은 승인된 변경 요청의 대상과 수량을 확인하는 네트워크 검증을 적용한다.
+
 ```sh
 python -m zorocart run --request '한국어 쇼핑 요청' \
   --coupang-approval private/approved-scope.json \

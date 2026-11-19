@@ -130,7 +130,7 @@ async def command(args: argparse.Namespace) -> int:
                                    profile_dir=args.profile_dir if approval else None)
         run.save(args.output or Path('logs') / f'{run.id}.json')
         print(json.dumps(result, ensure_ascii=False, indent=2))
-        return 0 if result['status'] == 'complete' else 1
+        return 0 if result['status'] in {'complete', 'search_verified'} else 1
     if args.runs < 1:
         raise ValueError('반복 횟수는 최소 1회입니다.')
     report = {}

@@ -110,6 +110,7 @@ async def execute_run(run: Run, store_url: str, *, headless=False, interactive=F
         approval.validate()
     if demo_cart_session is not None and run.environment != 'local':
         raise ValueError('시연 장바구니 세션은 로컬 상점에서만 사용할 수 있습니다.')
+    native_read_only = bool(approval and approval.native_read_only)
     deadline = time.monotonic() + timeout
     try:
         async with asyncio.timeout(timeout), async_playwright() as pw:
@@ -119,7 +120,10 @@ async def execute_run(run: Run, store_url: str, *, headless=False, interactive=F
             if executable := os.environ.get('ZOROCART_CHROMIUM_EXECUTABLE'):
                 options['executable_path'] = executable
             if profile_dir:
-                browser_context = await pw.chromium.launch_persistent_context(str(profile_dir), service_workers='block', **options)
+                worker_policy = 'allow' if native_read_only else 'block'
+                browser_context = await pw.chromium.launch_persistent_context(
+                    str(profile_dir), service_workers=worker_policy, **options,
+                )
                 browser_instance = None
             else:
                 browser_instance = await pw.chromium.launch(**options)
@@ -148,7 +152,8 @@ async def execute_run(run: Run, store_url: str, *, headless=False, interactive=F
                           reference_serving_commit=SERVING_COMMIT, visible_browser=not headless)
                 engine = ShoppingEngine(client, adapter, run.event, confirm=run.ask if interactive else None,
                                         score_threshold=float(os.environ.get('ZOROCART_MIN_SCORE', '2.5')),
-                                        choice_threshold=float(os.environ.get('ZOROCART_MIN_PROBABILITY', '0.70')))
+                                        choice_threshold=float(os.environ.get('ZOROCART_MIN_PROBABILITY', '0.70')),
+                                        search_only=native_read_only)
                 run.result = await engine.run(run.request)
             await browser_context.close()
             if browser_instance:

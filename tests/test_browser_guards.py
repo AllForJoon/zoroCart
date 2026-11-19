@@ -1,11 +1,13 @@
 import asyncio
 import os
 import socket
+from dataclasses import replace
 from types import SimpleNamespace
 
 import pytest
 import uvicorn
 from fastapi import FastAPI
+from fastapi.responses import HTMLResponse
 from playwright.async_api import Error as PlaywrightError, async_playwright
 
 from zorocart.browser import LOCAL_DOM, BrowserAdapter, BrowserBlocked, CoupangApproval, StaleObservation
@@ -67,6 +69,62 @@ def test_confirmed_desktop_reads_when_no_write_contract_is_configured():
     assert not any((approval.can_write, approval.can_add, approval.can_clear))
 
 
+def test_native_desktop_guest_monitors_main_responses_without_routes_or_writes():
+    approval = CoupangApproval(
+        reference="fixture", home_url="https://www.coupang.com/", read_paths=("/",),
+        cart_url="https://cart.coupang.com/cartView.pang", desktop_ui=True,
+    )
+    assert approval.native_read_only
+    assert not replace(
+        approval, add_path="/fixture/add",
+        add_fields={"product": "productId", "option": "optionId", "quantity": "count"},
+    ).native_read_only
+    assert not replace(
+        approval, clear_path="/fixture/clear", clear_items_field="items",
+    ).native_read_only
+
+    class Page:
+        url = approval.home_url
+        main_frame = object()
+
+        def __init__(self):
+            self.context = self
+            self.listeners = {}
+
+        async def route(self, *_):
+            pytest.fail("Native guest reads must retain Chrome's normal read networking")
+
+        def on(self, name, callback):
+            self.listeners.setdefault(name, []).append(callback)
+
+    async def exercise():
+        page = Page()
+        adapter = CoupangDesktopAdapter(page, approval.home_url, mode="coupang", approval=approval)
+        await adapter._initialize()
+        await adapter._initialize()
+        [on_response] = page.listeners["response"]
+
+        def denied(frame):
+            return SimpleNamespace(
+                status=403, request=SimpleNamespace(frame=frame, is_navigation_request=lambda: True),
+            )
+
+        on_response(denied(object()))
+        adapter._require_current_url()
+        with pytest.raises(BrowserBlocked):
+            await adapter._add(None, None, 1)
+        with pytest.raises(BrowserBlocked):
+            await adapter._clear(None, {}, ())
+        assert adapter._pending_path is None
+        assert not adapter._write_dispatched
+
+        on_response(denied(page.main_frame))
+        with pytest.raises(BrowserBlocked, match="HTTP 403"):
+            adapter._require_current_url()
+
+    asyncio.run(exercise())
+
+
 def test_desktop_guest_cart_recognizes_legacy_empty_page():
     async def exercise():
         approval = CoupangApproval(
@@ -125,6 +183,18 @@ def test_browser_revalidates_nodes_and_cart_write_payloads():
 
 async def exercise_browser_guards():
     app = FastAPI()
+
+    @app.get("/store/product/embedded-frames", response_class=HTMLResponse)
+    async def embedded_frames():
+        return """<main data-zc-view="detail">
+        <iframe src="/store/product/denied-frame"></iframe>
+        <iframe src="/outside-scope"></iframe>
+        </main>"""
+
+    @app.get("/store/product/denied-frame", response_class=HTMLResponse)
+    async def denied_frame():
+        return HTMLResponse("<p>Embedded frame denied</p>", status_code=403)
+
     app.include_router(router)
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
@@ -148,11 +218,26 @@ async def exercise_browser_guards():
                     page = await context.new_page()
                     adapter = BrowserAdapter(page, address, action_timeout_ms=2_000)
                     await assert_browser_guards(adapter, page)
+                    await assert_child_frame_guards(adapter, page)
                 finally:
                     await browser.close()
         finally:
             server.should_exit = True
             await server_task
+
+
+async def assert_child_frame_guards(adapter, page):
+    # Observe a genuine 403 in an allowed frame and a separate request that
+    # the adapter itself aborts. Neither blocks the top-level product view.
+    address = adapter.home_url.removesuffix("/store")
+    async with (
+        page.expect_response(lambda response: response.url.endswith("/denied-frame")) as denied,
+        page.expect_event("requestfailed", lambda request: request.url.endswith("/outside-scope")) as outside,
+    ):
+        await adapter._goto(address + "/store/product/embedded-frames")
+    assert (await denied.value).status == 403
+    assert (await outside.value).failure
+    assert (await adapter.observe()).view == "detail"
 
 
 async def assert_browser_guards(adapter, page):

@@ -36,10 +36,14 @@ DESKTOP_SNAPSHOT = r'''
   const logout = Boolean(first(document, 'a[href*="/logout"]'));
   function add(role, element, label, key = role, href = null, card_facts = {}) {
     if (!element || element.matches(':disabled,[aria-disabled=true]')) return;
+    const form = role === 'search-submit' ? element.form : null;
     nodes.push(element);
     controls.push({role, key, label, href, tag: element.tagName.toLowerCase(),
       aria_role: element.getAttribute('role') || '', value: ['search-input', 'quantity'].includes(role) ? element.value : '',
-      destination: '', selected: false, card_facts, options: []});
+      form: form ? (element.hasAttribute('formaction') ? element.formAction : form.action) : '',
+      method: form ? (element.getAttribute('formmethod') || form.method) : '',
+      destination: form ? (element.getAttribute('formtarget') || form.target) : '',
+      selected: false, card_facts, options: []});
   }
   function product(value) {
     try {
@@ -64,8 +68,9 @@ DESKTOP_SNAPSHOT = r'''
   const cartLink = all(document, 'a[href*="cart.coupang.com/cartView.pang"]').find(e => e.id === 'wa-cart-link');
   if (cartLink) add('cart', cartLink, '장바구니', 'cart', 'https://cart.coupang.com/cartView.pang');
   if (view === 'home' || view === 'results') {
-    const form = document.querySelector('#wa-search-form-tablet');
-    add('search-input', first(form, 'input[name=q]'), '쿠팡 상품 검색');
+    const input = first(document, '#wa-search-form input[name=q], #wa-search-form-tablet input[name=q], #wa-sticky-search input[name=q]');
+    const form = input?.form;
+    add('search-input', input, '쿠팡 상품 검색');
     const buttons = all(form, 'button');
     const submit = buttons.filter(e => e.getAttribute('type') === 'submit');
     add('search-submit', buttons.find(e => [clean(e), e.title, e.getAttribute('aria-label')].includes('검색')) ||
@@ -139,6 +144,19 @@ DESKTOP_SNAPSHOT = r'''
 class CoupangDesktopAdapter(BrowserAdapter):
     """Translate observed Coupang controls into the existing shopping roles."""
 
+    async def _initialize(self) -> None:
+        if self.can_add or self.can_clear:
+            await super()._initialize()
+        elif not getattr(self, '_read_observers_ready', False):
+            self.page.on('response', self._on_response)
+            self.page.on('popup', self._close_unexpected_popup)
+            self._read_observers_ready = True
+
+    @staticmethod
+    async def _close_unexpected_popup(page) -> None:
+        if not page.is_closed():
+            await page.close()
+
     async def open_home(self) -> None:
         await super().open_home()
         try:
@@ -146,6 +164,14 @@ class CoupangDesktopAdapter(BrowserAdapter):
                 state='visible', timeout=self.action_timeout_ms)
         except PlaywrightError as exc:
             raise BrowserBlocked('쿠팡에서 비로그인 상태를 확인하지 못했습니다.') from exc
+        try:
+            await self.page.locator(
+                '#wa-search-form input[name=q]:visible, #wa-search-form-tablet input[name=q]:visible, '
+                '#wa-sticky-search input[name=q]:visible',
+            ).first.wait_for(state='visible', timeout=self.action_timeout_ms)
+        except PlaywrightError as exc:
+            self._require_current_url()
+            raise BrowserError('표시된 쿠팡 상품 검색창을 확인할 수 없습니다.') from exc
 
     async def _capture(self):
         self._require_current_url()
@@ -169,6 +195,27 @@ class CoupangDesktopAdapter(BrowserAdapter):
 
     async def execute(self, observation, action, target_id=None, value=None, **guards):
         target = next((item for item in observation.targets if item.id == target_id), None)
+        if target and target.role == 'search-submit' and action == 'CLICK' and not (self.can_add or self.can_clear):
+            node = self._nodes.get(target.id)
+            if observation is not self._active or node is None:
+                raise StaleObservation('검색 버튼이 현재 화면에서 다시 관찰되어야 합니다.')
+            self._require_current_url()
+            try:
+                form = await node.evaluate("""(el) => ({
+                    attached: el.isConnected,
+                    type: el.type,
+                    action: el.form ? (el.hasAttribute('formaction') ? el.formAction : el.form.action) : '',
+                    method: el.getAttribute('formmethod') || el.form?.method || '',
+                    target: el.getAttribute('formtarget') ?? el.form?.target ?? '',
+                })""")
+            except PlaywrightError as exc:
+                self._require_current_url()
+                raise StaleObservation('쿠팡 검색 버튼이 변경됐습니다.') from exc
+            if not form['attached']:
+                raise StaleObservation('쿠팡 검색 버튼이 변경됐습니다.')
+            if (form['type'] != 'submit' or form['method'].lower() != 'get' or form['target'] not in {'', '_self'}
+                    or not self._in_scope(form['action']) or urlsplit(form['action']).path != '/np/search'):
+                raise BrowserBlocked('쿠팡의 조회 전용 검색 양식을 확인할 수 없습니다.')
         if target and target.role == 'card' and action == 'CLICK':
             if observation is not self._active or self.page.url != self._observation_url or await self._read() != self._snapshot:
                 raise StaleObservation('검색 화면의 상품 카드가 바뀌었습니다.')

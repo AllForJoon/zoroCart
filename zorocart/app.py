@@ -34,6 +34,8 @@ def create_app(*, store_url: str, log_dir: Path, headless: bool = False,
         coupang_approval.validate()
         if not coupang_approval.desktop_ui:
             raise ValueError('대시보드 쿠팡 모드에는 데스크톱 비로그인 프로필이 필요합니다.')
+        if not (coupang_approval.native_read_only or coupang_approval.can_write):
+            raise ValueError('쿠팡 장바구니 실행에는 비우기와 담기 경로를 함께 설정하세요.')
 
     runs: dict[str, Run] = {}
     tasks: set[asyncio.Task] = set()
