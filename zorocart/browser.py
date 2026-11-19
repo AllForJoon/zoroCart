@@ -1,0 +1,917 @@
+"""Observe and operate the shopping surface through an isolated Playwright page."""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import re
+import time
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from urllib.parse import parse_qsl, urljoin, urlsplit
+
+from playwright.async_api import ElementHandle, Error as PlaywrightError, Page, Route
+
+CONTROL_ACTIONS = {
+    "search-input": "TYPE_TEXT",
+    "search-submit": "CLICK",
+    "card": "CLICK",
+    "option": "SELECT_OPTION",
+    "quantity": "SET_QUANTITY",
+    "add": "CLICK",
+    "cart": "CLICK",
+}
+VIEW_ROLES = {
+    "home": {"search-input", "search-submit", "cart"},
+    "results": {"search-input", "search-submit", "card", "cart"},
+    "detail": {"option", "quantity", "add", "cart"},
+    "cart": {"cart"},
+}
+FIELDS = (
+    "name", "price", "pack", "capacity", "stock", "shipping", "shipping-price",
+    "attributes", "quantity", "option", "category",
+)
+BLOCKED_PATH = re.compile(
+    r"(?:^|[/_.-])(?:login|signin|captcha|access-denied)(?:[/_.-]|$)", re.I
+)
+FORBIDDEN_PATH = re.compile(
+    r"(?:^|[/_.-])(?:order|orders|checkout|payment|pay|purchase|buy)(?:[/_.-]|$)", re.I
+)
+SAFE_KEY = re.compile(r"[A-Za-z0-9_.:-]{1,120}\Z")
+COUNT = r"(?:[0-9]{1,3}(?:,[0-9]{3})+|[0-9]+)"
+
+
+class BrowserError(RuntimeError):
+    """The browser could not establish a required shopping fact or action."""
+
+
+class BrowserBlocked(BrowserError):
+    """The observed page requires intervention or falls outside the allowed scope."""
+
+
+class StaleObservation(BrowserError):
+    """A decision referred to a changed document or DOM node."""
+
+
+class AmbiguousAdd(BrowserError):
+    """An attempted add must be reconciled by reading the cart before any retry."""
+
+
+@dataclass(frozen=True)
+class Target:
+    id: str
+    role: str
+    key: str
+    label: str
+    action: str
+    facts: dict[str, object] = field(default_factory=dict)
+    url: str | None = None
+
+
+@dataclass(frozen=True)
+class Observation:
+    view: str
+    targets: tuple[Target, ...]
+    facts: dict[str, object]
+    epoch: int
+
+    def model_context(self) -> dict[str, object]:
+        return {
+            "view": self.view,
+            "facts": self.facts,
+            "targets": [
+                {
+                    "id": target.id,
+                    "role": target.role,
+                    "key": target.key,
+                    "label": target.label,
+                    "action": target.action,
+                    "facts": target.facts,
+                }
+                for target in self.targets
+            ],
+        }
+
+
+@dataclass(frozen=True)
+class Offer:
+    product_id: str
+    option_id: str
+    title: str
+    label: str
+    unit_price: int | None
+    pack_count: int | None
+    capacity: int | None
+    capacity_unit: str | None
+    stock: int | None
+    delivery: str
+    shipping_fee: int | None
+    attributes: tuple[str, ...]
+    category: str
+    url: str
+    selected: bool
+
+
+@dataclass(frozen=True)
+class CartLine:
+    product_id: str
+    option_id: str
+    title: str
+    label: str
+    unit_price: int
+    quantity: int
+    pack_count: int | None
+    delivery: str
+    shipping_fee: int | None
+
+
+@dataclass(frozen=True)
+class CoupangApproval:
+    """Operator-supplied scope and DOM selectors verified against approved pages."""
+
+    reference: str = field(repr=False)
+    home_url: str
+    cart_url: str
+    read_paths: tuple[str, ...]
+    add_path: str
+    dom: dict[str, object] = field(repr=False)
+    add_fields: dict[str, str] = field(repr=False)
+    asset_hosts: tuple[str, ...] = ()
+
+    @classmethod
+    def from_file(cls, path: str | Path) -> CoupangApproval:
+        try:
+            data = json.loads(Path(path).read_text(encoding="utf-8"))
+            if not isinstance(data, dict):
+                raise ValueError
+            approval = cls(
+                reference=data["reference"],
+                home_url=data["home_url"],
+                cart_url=data["cart_url"],
+                read_paths=tuple(data["read_paths"]),
+                add_path=data["add_path"],
+                dom=data["dom"],
+                add_fields=data["add_fields"],
+                asset_hosts=tuple(data.get("asset_hosts", ())),
+            )
+            approval.validate()
+        except (OSError, ValueError, KeyError, TypeError, re.error) as exc:
+            raise BrowserBlocked("승인된 쿠팡 범위와 화면 설정을 확인할 수 없습니다.") from exc
+        return approval
+
+    def validate(self) -> None:
+        if (
+            not isinstance(self.reference, str)
+            or not self.reference.strip()
+            or not self.read_paths
+            or any(not path.startswith("/") or len(path) > 250 for path in self.read_paths)
+            or not re.fullmatch(r"/[A-Za-z0-9/_\-.]+", self.add_path)
+            or BLOCKED_PATH.search(self.add_path)
+            or FORBIDDEN_PATH.search(self.add_path)
+        ):
+            raise ValueError("Invalid approved paths or reference")
+        home, cart = urlsplit(self.home_url), urlsplit(self.cart_url)
+        if (
+            home.scheme != "https"
+            or home.hostname not in {"www.coupang.com", "m.coupang.com", "coupang.com"}
+            or _origin(home) != _origin(cart)
+            or home.port not in (None, 443)
+            or any(part.username or part.password or part.fragment for part in (home, cart))
+            or any(
+                not any(re.fullmatch(rule, part.path or "/") for rule in self.read_paths)
+                or BLOCKED_PATH.search(part.path)
+                or FORBIDDEN_PATH.search(part.path)
+                for part in (home, cart)
+            )
+        ):
+            raise ValueError("Invalid approved Coupang origin or navigation")
+        if not isinstance(self.dom, dict):
+            raise ValueError("Missing approved DOM settings")
+        if (
+            not isinstance(self.add_fields, dict)
+            or set(self.add_fields) != {"product", "option", "quantity"}
+            or any(
+                not isinstance(name, str) or not name.strip() for name in self.add_fields.values()
+            )
+            or len(set(self.add_fields.values())) != 3
+        ):
+            raise ValueError("Incomplete approved add fields")
+        for member, keys in (
+            ("views", ("home", "results", "detail", "cart")),
+            ("controls", tuple(CONTROL_ACTIONS)),
+            ("fields", tuple(key for key in FIELDS if key != "capacity")),
+        ):
+            group = self.dom.get(member)
+            if not isinstance(group, dict) or any(
+                not isinstance(group.get(key), str) or not group[key].strip() for key in keys
+            ):
+                raise ValueError("Incomplete approved DOM settings")
+        for key in (
+            "product", "variant", "cart_row", "empty", "selected",
+            "key_attr", "option_attr",
+        ):
+            value = self.dom.get(key)
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError("Incomplete approved DOM settings")
+        if any(not re.fullmatch(r"[a-z0-9.-]+", host) for host in self.asset_hosts):
+            raise ValueError("Invalid approved asset hostname")
+
+
+LOCAL_DOM = {
+    "views": {
+        view: f'[data-zc-view="{view}"]'
+        for view in ("home", "results", "detail", "cart", "blocked")
+    },
+    "controls": {role: f'[data-zc-control="{role}"]' for role in CONTROL_ACTIONS},
+    "fields": {name: f'[data-zc-field="{name}"]' for name in FIELDS},
+    "product": "[data-zc-product]",
+    "variant": "[data-zc-variant]",
+    "cart_row": "[data-zc-row]",
+    "empty": "[data-zc-empty]",
+    "selected": '[aria-pressed="true"], [aria-selected="true"], [data-zc-selected="true"]',
+    "key_attr": "data-zc-id",
+    "option_attr": "data-zc-option",
+    "unit_attr": "data-zc-unit",
+}
+
+# Snapshot and node references come from the same document evaluation. The page
+# can supply product facts and labels, while code owns selectors and operations.
+SNAPSHOT = r"""
+(cfg) => {
+  const clean = (value) => (value || "").replace(/\s+/g, " ").trim().slice(0, 240);
+  const visible = (el) => Boolean(el && el.isConnected && el.getClientRects().length &&
+    !el.closest("[hidden], [inert], [aria-hidden=true]") &&
+    !["hidden", "collapse"].includes(getComputedStyle(el).visibility));
+  const active = (el) => !el.matches(":disabled") && !el.closest("[aria-disabled=true]");
+  const find = (root, selector) => selector ?
+    [...root.querySelectorAll(selector)].filter(visible) : [];
+  const first = (root, selector) => find(root, selector)[0];
+  const label = (el) => clean(el.getAttribute("aria-label") ||
+    [...(el.labels || [])].map(node => node.innerText).join(" ") ||
+    el.innerText || el.getAttribute("placeholder") || el.getAttribute("title"));
+  const key = (el, attr = cfg.key_attr) => clean(el?.getAttribute(attr));
+  const href = (el) => el.tagName === "A" ? el.href : null;
+  const fieldData = (root) => Object.fromEntries(Object.entries(cfg.fields).map(([name, selector]) =>
+    [name, find(root, selector).slice(0, 15).map(el => ({
+      text: clean(el.innerText),
+      unit: clean(cfg.unit_attr && el.getAttribute(cfg.unit_attr)),
+    }))]));
+  const blocked = Boolean(first(document, cfg.views.blocked) || first(document,
+    'input[type=password], iframe[src*="recaptcha"], iframe[src*="captcha"], [data-sitekey]') ||
+    find(document, 'h1, h2, [role=alert]').some(el =>
+      /^(?:access denied|forbidden|접근이 제한|접근 권한이 없|비정상적인 접근|본인 인증|로그인이 필요|captcha)/i
+        .test(label(el))));
+  const view = blocked ? "blocked" :
+    (["cart", "detail", "results", "home"].find(name => first(document, cfg.views[name])) || "unknown");
+  if (blocked) return {root: document.documentElement, nodes: [], payload: {
+    view, controls: [], offers: [], rows: [], empty: false,
+  }};
+  const nodes = [];
+  const controls = [];
+  for (const [role, selector] of Object.entries(cfg.controls)) {
+    for (const el of find(document, selector).slice(0, role === "card" ? 6 : 24)) {
+      if (!active(el)) continue;
+      const name = label(el);
+      if (/바로\s*구매|주문하기|결제하기|buy\s*now|checkout|place\s*order/i.test(name)) continue;
+      if (role === "search-input" && !el.matches('input[type=search], input[type=text], input:not([type])')) continue;
+      if (role === "quantity" && !el.matches('input[type=number], select')) continue;
+      if (["card", "cart"].includes(role) && el.tagName !== "A") continue;
+      if (["search-submit", "option", "add"].includes(role) &&
+          !el.matches('button, [role=button], input[type=submit]')) continue;
+      if (role === "add" && !/장바구니\s*담기|장바구니에\s*담기|add\s*to\s*cart/i.test(name)) continue;
+      nodes.push(el);
+      controls.push({
+        role, key: key(el) || (role === "card" ? "" : role),
+        label: name, href: href(el),
+        tag: el.tagName.toLowerCase(), aria_role: clean(el.getAttribute("role")),
+        value: ["search-input", "quantity"].includes(role) ? clean(el.value) : "",
+        selected: role === "option" ? el.matches(cfg.selected) : false,
+        form: el.form ? el.form.action : null,
+        method: el.form ? el.form.method : null,
+        destination: clean(el.getAttribute("target") || el.getAttribute("formtarget") || el.form?.target),
+        card_facts: role === "card" ? fieldData(el) : {},
+        options: el.tagName === "SELECT" ? [...el.options]
+          .filter(option => !option.disabled).map(option => clean(option.value)) : [],
+      });
+    }
+  }
+  const product = view === "detail" ? first(document, cfg.product) : null;
+  const offers = product ? find(product, cfg.variant).map(variant => ({
+    product_id: key(product),
+    option_id: key(variant),
+    selected: variant.matches(cfg.selected) || Boolean(first(variant, cfg.selected)),
+    fields: fieldData(variant),
+    product_fields: fieldData(product),
+  })) : [];
+  const rows = view === "cart" ? find(document, cfg.cart_row).map(row => ({
+    product_id: key(row), option_id: key(row, cfg.option_attr), fields: fieldData(row),
+  })) : [];
+  return {root: document.documentElement, nodes, payload: {
+    view, controls, offers, rows, empty: view === "cart" && Boolean(first(document, cfg.empty)),
+  }};
+}
+"""
+
+
+def _origin(parsed) -> tuple[str, str | None, int | None]:
+    return parsed.scheme, parsed.hostname, parsed.port or {"https": 443, "http": 80}.get(
+        parsed.scheme
+    )
+
+
+def _unique_fields(pairs) -> dict:
+    fields = dict(pairs)
+    if len(fields) != len(pairs):
+        raise ValueError("Repeated write field")
+    return fields
+
+
+def _texts(fields: dict, name: str) -> tuple[str, ...]:
+    return tuple(dict.fromkeys(entry["text"] for entry in fields.get(name, []) if entry["text"]))
+
+
+def _text(fields: dict, name: str) -> str:
+    texts = _texts(fields, name)
+    return texts[0] if len(texts) == 1 else ""
+
+
+def _number(value: str, units: str) -> int | None:
+    match = re.fullmatch(rf"({COUNT})\s*(?:{units})?", value, re.I)
+    if not match:
+        return None
+    amount = int(match[1].replace(",", ""))
+    return amount if amount <= 1_000_000_000 else None
+
+
+def _shipping_fee(value: str) -> int | None:
+    if value in ("무료", "무료배송", "배송비 무료"):
+        return 0
+    return _number(value.removeprefix("배송비").strip(), "원")
+
+
+def _stock(value: str) -> int | None:
+    if value == "품절":
+        return 0
+    match = re.fullmatch(rf"최대\s+({COUNT})\s*(?:개|팩|세트)?\s*구매 가능", value)
+    return _number(match[1] if match else value, "개|팩|세트")
+
+
+def _capacity(fields: dict) -> tuple[int | None, str | None]:
+    entries = fields.get("capacity", [])
+    if len(entries) != 1:
+        return None, None
+    entry = entries[0]
+    units = {
+        "g": "g", "kg": "kg", "ml": "ml", "l": "l", "인분": "serving",
+        "serving": "serving", "servings": "serving", "개": "piece", "매": "piece", "piece": "piece",
+    }
+    match = re.fullmatch(rf"({COUNT})\s*({'|'.join(units)})?", entry["text"], re.I)
+    if not match:
+        return None, None
+    unit = units.get((match[2] or entry["unit"]).lower())
+    if match[2] and entry["unit"] and units.get(entry["unit"].lower()) != unit:
+        return None, None
+    return (int(match[1].replace(",", "")), unit) if unit else (None, None)
+
+
+class BrowserAdapter:
+    def __init__(
+        self,
+        page: Page,
+        store_url: str,
+        mode: str = "local",
+        approval: CoupangApproval | str | Path | None = None,
+        *,
+        action_timeout_ms: int = 4_000,
+        max_steps: int = 140,
+        deadline: float | None = None,
+    ):
+        self.page = page
+        self.mode = mode
+        self.action_timeout_ms = action_timeout_ms
+        self.max_steps = max_steps
+        self.deadline = deadline
+        self.steps = 0
+        self._active: Observation | None = None
+        self._snapshot: dict | None = None
+        self._nodes: dict[str, ElementHandle] = {}
+        self._epoch = 0
+        self._routing = False
+        self._network_blocked = False
+        self._add_requests_left = 0
+        self._write_dispatched = False
+        self._write_blocked = False
+        self._expected_write: dict[str, str] | None = None
+        self._observed_products: set[str] = set()
+        self._results_url: str | None = None
+        self._asset_hosts: tuple[str, ...] = ()
+        if mode == "local":
+            parsed = urlsplit(store_url)
+            if (
+                parsed.scheme not in {"http", "https"}
+                or parsed.hostname not in {"127.0.0.1", "localhost", "::1"}
+                or parsed.username
+                or parsed.password
+                or (parsed.query and not re.fullmatch(r"fault=[a-z-]{1,50}", parsed.query))
+                or parsed.fragment
+                or parsed.path.rstrip("/") not in {"", "/store"}
+            ):
+                raise BrowserBlocked("시연 상점은 로컬 루프백 주소에서만 열 수 있습니다.")
+            base = parsed._replace(path="", query="").geturl()
+            self.home_url = base + "/store" + (f"?{parsed.query}" if parsed.query else "")
+            self.cart_url = base + "/store/cart"
+            self._read_paths = (r"/store", r"/store/search", r"/store/cart", r"/store/product/[\w-]+")
+            self._add_path = "/store/cart/add"
+            self._add_fields = {"product": "product", "option": "option", "quantity": "quantity"}
+            self._dom = LOCAL_DOM
+        elif mode == "coupang" and approval:
+            if not isinstance(approval, CoupangApproval):
+                approval = CoupangApproval.from_file(approval)
+            try:
+                approval.validate()
+            except (ValueError, TypeError, re.error) as exc:
+                raise BrowserBlocked("승인된 쿠팡 범위와 화면 설정을 확인할 수 없습니다.") from exc
+            if store_url and store_url.rstrip("/") != approval.home_url.rstrip("/"):
+                raise BrowserBlocked("요청 상점 주소가 쿠팡 승인 범위와 다릅니다.")
+            self.home_url = approval.home_url
+            self.cart_url = approval.cart_url
+            self._read_paths = approval.read_paths
+            self._add_path = approval.add_path
+            self._add_fields = approval.add_fields
+            self._dom = approval.dom
+            self._asset_hosts = approval.asset_hosts
+        else:
+            raise BrowserBlocked("쿠팡 실사이트 실행에는 쿠팡 승인 범위와 승인된 화면 설정이 필요합니다.")
+        self._shop_origin = _origin(urlsplit(self.home_url))
+
+    def _in_scope(self, url: str) -> bool:
+        try:
+            parsed = urlsplit(url)
+            path = parsed.path or "/"
+            return (
+                _origin(parsed) == self._shop_origin
+                and not (parsed.username or parsed.password or parsed.fragment)
+                and "%" not in path
+                and not BLOCKED_PATH.search(path)
+                and not FORBIDDEN_PATH.search(path)
+                and any(re.fullmatch(rule, path) for rule in self._read_paths)
+            )
+        except ValueError:
+            return False
+
+    def _is_add_url(self, url: str) -> bool:
+        parsed = urlsplit(url)
+        return (
+            _origin(parsed) == self._shop_origin
+            and parsed.path == self._add_path
+            and not (parsed.username or parsed.password or parsed.query or parsed.fragment)
+        )
+
+    async def _route(self, route: Route) -> None:
+        request = route.request
+        url = request.url
+        if request.method == "POST" and self._add_requests_left and self._is_add_url(url):
+            if not self._correct_write(request.post_data, request.headers.get("content-type", "")):
+                self._write_blocked = True
+                self._add_requests_left = 0
+                await route.abort()
+                return
+            self._add_requests_left -= 1
+            self._write_dispatched = True
+            if self.mode == "coupang":
+                # Inspect the approved write response without following method-preserving redirects.
+                try:
+                    response = await route.fetch(
+                        max_redirects=0, max_retries=0, timeout=self.action_timeout_ms,
+                    )
+                except PlaywrightError:
+                    await route.abort()
+                    return
+                location = response.headers.get("location")
+                if response.status in {307, 308} or (
+                    location and not self._in_scope(urljoin(url, location))
+                ):
+                    self._network_blocked = True
+                    await route.abort()
+                else:
+                    await route.fulfill(response=response)
+            else:
+                await route.continue_()
+        elif request.method == "GET" and self._in_scope(url):
+            await route.continue_()
+        elif request.method == "GET" and request.resource_type in {
+            "image", "stylesheet", "script", "font",
+        } and not request.is_navigation_request():
+            parsed = urlsplit(url)
+            if (
+                _origin(parsed) == self._shop_origin
+                or (parsed.scheme == "https" and parsed.hostname in self._asset_hosts)
+            ) and not FORBIDDEN_PATH.search(parsed.path):
+                await route.continue_()
+            else:
+                await route.abort()
+        else:
+            if request.is_navigation_request():
+                self._network_blocked = True
+            await route.abort()
+
+    def _correct_write(self, body: str | None, content_type: str) -> bool:
+        if body is None:
+            return False
+        media_type = content_type.split(";", 1)[0].strip().lower()
+        try:
+            if media_type == "application/json":
+                data = json.loads(body, object_pairs_hook=_unique_fields)
+            elif media_type == "application/x-www-form-urlencoded":
+                data = _unique_fields(parse_qsl(body, keep_blank_values=True, max_num_fields=100))
+            else:
+                return False
+        except ValueError:
+            return False
+        return (
+            self._expected_write is not None
+            and isinstance(data, dict)
+            and all(
+                type(data.get(key)) in {str, int} and str(data[key]) == value
+                for key, value in self._expected_write.items()
+            )
+        )
+
+    @property
+    def can_retry_unchanged_cart(self) -> bool:
+        # The synthetic shop resolves the mutation before any simulated reply delay.
+        return self.mode == "local" or not self._write_dispatched
+
+    @staticmethod
+    async def _block_other_pages(route: Route) -> None:
+        await route.abort()
+
+    async def _initialize(self) -> None:
+        if not self._routing:
+            # This adapter runs in a new context with service_workers="block".
+            # The selected page route takes precedence. Other pages, including
+            # the first request from a popup, have no approved action target.
+            if self.mode == "coupang":
+                await self.page.context.route("**/*", self._block_other_pages)
+            await self.page.route("**/*", self._route)
+            self.page.on("response", self._on_response)
+            self._routing = True
+
+    def _on_response(self, response) -> None:
+        if response.status in {401, 403, 429} and response.request.is_navigation_request():
+            self._network_blocked = True
+
+    def _step(self, *, before_add: bool = False, recovery: bool = False) -> None:
+        # Leave room for opening the cart and the final verification decision.
+        steps_needed = 3 if before_add else 1
+        if not recovery and self.steps + steps_needed > self.max_steps:
+            raise BrowserBlocked("브라우저 조작 단계 한도에 도달했습니다.")
+        reserve = 2 * self.action_timeout_ms / 1_000 if before_add else 0
+        if self.deadline is not None and time.monotonic() + reserve >= self.deadline:
+            raise BrowserBlocked("장바구니 검증에 필요한 실행 시간이 남아 있지 않습니다.")
+        self.steps += 1
+
+    def _require_current_url(self) -> None:
+        if self._network_blocked or not self._in_scope(self.page.url):
+            raise BrowserBlocked("로그인·접근 제한 또는 승인 범위 밖으로 이동이 감지됐습니다.")
+
+    async def _goto(self, url: str, *, recovery: bool = False) -> None:
+        if not self._in_scope(url):
+            raise BrowserBlocked("요청 주소가 상점 허용 범위를 벗어났습니다.")
+        await self._initialize()
+        self._active = None
+        self._network_blocked = False
+        for attempt in range(2):
+            self._step(recovery=recovery)
+            try:
+                response = await self.page.goto(
+                    url, wait_until="domcontentloaded", timeout=self.action_timeout_ms
+                )
+                break
+            except PlaywrightError as exc:
+                if self._network_blocked:
+                    raise BrowserBlocked("로그인 또는 허용 범위 밖으로 이동이 감지됐습니다.") from exc
+                if attempt or self.page.is_closed():
+                    raise BrowserError("상점 화면을 열지 못했습니다.") from exc
+        self._require_current_url()
+        if response is not None and response.status in {401, 403, 429}:
+            self._network_blocked = True
+            raise BrowserBlocked("상점에서 로그인 또는 접근 제한을 알렸습니다.")
+
+    async def open_home(self) -> None:
+        await self._goto(self.home_url)
+
+    async def open_cart(self) -> None:
+        """Use the scoped cart read URL after an uncertain add."""
+        await self._goto(self.cart_url, recovery=self._write_dispatched)
+
+    async def open_product(self, url: str) -> None:
+        """Reopen a product URL previously observed on the search surface."""
+        if url not in self._observed_products:
+            raise BrowserBlocked("검색 화면에서 확인한 상품 주소만 다시 열 수 있습니다.")
+        await self._goto(url)
+
+    async def return_to_results(self) -> None:
+        if self._results_url is None:
+            raise BrowserError("앞서 관찰한 검색 결과를 확인할 수 없습니다.")
+        await self._goto(self._results_url)
+
+    async def _capture(self):
+        self._require_current_url()
+        try:
+            handle = await self.page.evaluate_handle(SNAPSHOT, self._dom)
+            payload = await handle.get_property("payload")
+            data = await payload.json_value()
+            await payload.dispose()
+        except PlaywrightError as exc:
+            self._require_current_url()
+            raise StaleObservation("화면이 바뀌어 다시 관찰해야 합니다.") from exc
+        if data["view"] == "blocked":
+            await handle.dispose()
+            raise BrowserBlocked("로그인, CAPTCHA 또는 상점 접근 제한을 확인했습니다.")
+        if data["view"] == "unknown":
+            await handle.dispose()
+            raise BrowserBlocked("상점에서 인식할 수 있는 화면을 확인하지 못했습니다.")
+        return handle, data
+
+    async def _read(self) -> dict:
+        handle, data = await self._capture()
+        await handle.dispose()
+        return data
+
+    async def observe(self) -> Observation:
+        handle, data = await self._capture()
+        await self._clear_handles()
+        self._epoch += 1
+        self._document = (await handle.get_property("root")).as_element()
+        node_list = await handle.get_property("nodes")
+        nodes = await node_list.get_properties()
+        await node_list.dispose()
+        await handle.dispose()
+        targets = []
+        for index, item in enumerate(data["controls"]):
+            node = nodes.get(str(index))
+            if node is None:
+                continue
+            role, url = item["role"], item["href"]
+            if (
+                item["destination"] not in {"", "_self"}
+                or role not in VIEW_ROLES[data["view"]]
+                or (url and not self._in_scope(url))
+                or (role in {"card", "option"} and not SAFE_KEY.fullmatch(item["key"]))
+            ):
+                await node.dispose()
+                continue
+            if role == "card" and url:
+                self._observed_products.add(url)
+            target_id = f"O{self._epoch}-{index + 1}"
+            facts = {
+                "tag": item["tag"],
+                "accessibility_role": item["aria_role"],
+            }
+            if role == "quantity":
+                facts["value"] = item["value"]
+                facts["options"] = item["options"]
+            if role == "option":
+                facts["selected"] = item["selected"]
+            if role == "card":
+                facts.update(
+                    (key, value)
+                    for key in ("name", "price", "shipping", "option", "stock")
+                    if (value := _text(item["card_facts"], key))
+                )
+            targets.append(Target(
+                target_id, role, item["key"], item["label"], CONTROL_ACTIONS[role], facts, url,
+            ))
+            if element := node.as_element():
+                self._nodes[target_id] = element
+        self._snapshot = data
+        self._observation_url = self.page.url
+        if data["view"] == "results":
+            self._results_url = self._observation_url
+        self._active = Observation(
+            data["view"], tuple(targets),
+            {
+                "result_count": sum(target.role == "card" for target in targets),
+                "option_count": len(data["offers"]),
+                "cart_line_count": len(data["rows"]),
+                "cart_empty": data["empty"],
+            },
+            self._epoch,
+        )
+        return self._active
+
+    async def _clear_handles(self) -> None:
+        for node in (*self._nodes.values(), getattr(self, "_document", None)):
+            if node is None:
+                continue
+            try:
+                await node.dispose()
+            except PlaywrightError:
+                pass
+        self._nodes.clear()
+
+    def _offers(self, data: dict) -> tuple[Offer, ...]:
+        result = []
+        for row in data["offers"]:
+            fields, common = row["fields"], row["product_fields"]
+            product_id, option_id = row["product_id"], row["option_id"]
+            if not (SAFE_KEY.fullmatch(product_id) and SAFE_KEY.fullmatch(option_id)):
+                continue
+            capacity, unit = _capacity(fields)
+            result.append(Offer(
+                product_id=product_id,
+                option_id=option_id,
+                title=_text(fields, "name") or _text(common, "name"),
+                label=_text(fields, "option"),
+                unit_price=_number(_text(fields, "price"), "원"),
+                pack_count=_number(_text(fields, "pack"), "개|팩|매|세트|봉|병"),
+                capacity=capacity,
+                capacity_unit=unit,
+                stock=_stock(_text(fields, "stock")),
+                delivery=_text(fields, "shipping"),
+                shipping_fee=_shipping_fee(_text(fields, "shipping-price")),
+                attributes=_texts(fields, "attributes"),
+                category=_text(fields, "category") or _text(common, "category"),
+                url=self.page.url,
+                selected=row["selected"],
+            ))
+        return tuple(result)
+
+    async def details(self) -> tuple[Offer, ...]:
+        data = await self._read()
+        if data["view"] != "detail":
+            raise BrowserError("상품 상세 화면을 확인할 수 없습니다.")
+        return self._offers(data)
+
+    async def read_cart(self) -> tuple[CartLine, ...]:
+        data = await self._read()
+        if data["view"] != "cart" or (not data["rows"] and not data["empty"]):
+            raise BrowserError("장바구니 상품과 빈 장바구니 여부를 확인할 수 없습니다.")
+        lines: list[CartLine] = []
+        for row in data["rows"]:
+            fields = row["fields"]
+            p_id, o_id = row["product_id"], row["option_id"]
+            price = _number(_text(fields, "price"), "원")
+            count = _number(_text(fields, "quantity"), "개|팩|세트")
+            title, label = _text(fields, "name"), _text(fields, "option")
+            if not (
+                SAFE_KEY.fullmatch(p_id) and SAFE_KEY.fullmatch(o_id)
+                and price is not None and count and title and label
+            ):
+                raise BrowserError("장바구니에서 상품, 옵션, 가격 또는 수량을 확인할 수 없습니다.")
+            lines.append(CartLine(
+                p_id, o_id, title, label, price, count,
+                _number(_text(fields, "pack"), r"(?:개|팩|매|세트|봉|병)(?:\s*구성)?"),
+                _text(fields, "shipping"),
+                _shipping_fee(_text(fields, "shipping-price")),
+            ))
+        return tuple(lines)
+
+    async def execute(
+        self,
+        observation: Observation,
+        action: str,
+        target_id: str | None = None,
+        value: str | int | None = None,
+        *,
+        expected_offer: Offer | None = None,
+        expected_quantity: int | None = None,
+    ) -> None:
+        if observation is not self._active or self.page.url != self._observation_url:
+            raise StaleObservation("이 결정은 현재 화면의 관찰 결과에 속하지 않습니다.")
+        current = await self._read()
+        try:
+            same_document = self._document and await self._document.evaluate(
+                "(el) => el === document.documentElement"
+            )
+        except PlaywrightError:
+            same_document = False
+        self._active = None
+        if not same_document or current != self._snapshot:
+            raise StaleObservation("화면 내용이 바뀌어 다시 관찰해야 합니다.")
+        if action == "BLOCKED":
+            raise BrowserBlocked("Zoro-1이 현재 화면에서 진행할 수 없다고 판단했습니다.")
+        if action == "DONE":
+            self._step()
+            return
+        if action == "SCROLL":
+            self._step()
+            await self.page.mouse.wheel(0, -420 if value == "up" else 420)
+            return
+        if action == "WAIT":
+            self._step()
+            await asyncio.sleep(0.25)
+            return
+        target = next((item for item in observation.targets if item.id == target_id), None)
+        if not target or target.action != action:
+            raise StaleObservation("관찰 ID와 선택한 동작이 일치하지 않습니다.")
+        self._step(before_add=target.role == "add")
+        node = self._nodes.get(target.id)
+        try:
+            active = node and await node.evaluate("""(el) => el.isConnected &&
+                !el.closest('[hidden], [inert], [aria-hidden=true], [aria-disabled=true]')""")
+            if not active or not await node.is_visible() or not await node.is_enabled():
+                raise StaleObservation("선택한 요소가 교체되었거나 사용할 수 없습니다.")
+        except PlaywrightError as exc:
+            raise StaleObservation("선택한 요소가 현재 화면에 없습니다.") from exc
+
+        if target.role == "add":
+            self._require_add_evidence(current, expected_offer, expected_quantity)
+            await self._add(node, expected_offer, expected_quantity)
+            return
+        try:
+            if action == "TYPE_TEXT":
+                if (
+                    not isinstance(value, str)
+                    or value.strip() != value
+                    or not 1 <= len(value) <= 100
+                    or any(not character.isprintable() for character in value)
+                    or re.search(r"(?:https?://|javascript:|<|>)", value, re.I)
+                ):
+                    raise BrowserError("검색어는 검증된 한 줄의 일반 문자열이어야 합니다.")
+                await node.fill(value, timeout=self.action_timeout_ms)
+            elif action == "SET_QUANTITY":
+                if type(value) is not int or not 1 <= value <= 1_000:
+                    raise BrowserError("주문 수량을 확인할 수 없습니다.")
+                if target.facts["tag"] == "select":
+                    if str(value) not in target.facts["options"]:
+                        raise BrowserError("화면에서 선택한 주문 수량을 제공하지 않습니다.")
+                    await node.select_option(str(value), timeout=self.action_timeout_ms)
+                else:
+                    await node.fill(str(value), timeout=self.action_timeout_ms)
+                    await node.press("Tab", timeout=self.action_timeout_ms)
+            else:
+                await node.click(timeout=self.action_timeout_ms)
+                await self.page.wait_for_load_state("domcontentloaded", timeout=self.action_timeout_ms)
+                self._require_current_url()
+        except PlaywrightError as exc:
+            self._require_current_url()
+            raise StaleObservation("화면 조작 결과를 다시 관찰해야 합니다.") from exc
+
+    def _require_add_evidence(
+        self,
+        data: dict,
+        expected: Offer | None,
+        quantity: int | None,
+    ) -> None:
+        selected = [offer for offer in self._offers(data) if offer.selected]
+        quantities = [control["value"] for control in data["controls"] if control["role"] == "quantity"]
+        if (
+            data["view"] != "detail"
+            or expected is None
+            or type(quantity) is not int
+            or quantity < 1
+            or len(selected) != 1
+            or asdict(selected[0]) != {**asdict(expected), "selected": True}
+            or selected[0].stock is None
+            or selected[0].stock < quantity
+            or quantities != [str(quantity)]
+        ):
+            raise StaleObservation("추가 직전 상품·옵션·수량·가격을 다시 확인해야 합니다.")
+
+    async def _add(self, node: ElementHandle, offer: Offer, quantity: int) -> None:
+        self._require_current_url()
+        form = await node.evaluate(r"""(el) => ({
+            action: el.form ? (el.getAttribute("formaction") ? el.formAction : el.form.action) : null,
+            method: el.form ? (el.getAttribute("formmethod") || el.form.method) : null,
+            target: el.getAttribute("formtarget") || el.form?.target || "",
+        })""")
+        if (
+            form["target"] not in {"", "_self"}
+            or (form["action"] and (
+                not self._is_add_url(form["action"]) or form["method"].lower() != "post"
+            ))
+        ):
+            raise BrowserBlocked("장바구니 추가 요청이 승인 범위와 다릅니다.")
+        self._write_dispatched = False
+        self._write_blocked = False
+        self._expected_write = {
+            self._add_fields["product"]: offer.product_id,
+            self._add_fields["option"]: offer.option_id,
+            self._add_fields["quantity"]: str(quantity),
+        }
+        self._add_requests_left = 1
+        try:
+            async with self.page.expect_response(
+                lambda response: response.request.method == "POST" and self._is_add_url(response.url),
+                timeout=self.action_timeout_ms,
+            ) as response_info:
+                await node.click(timeout=self.action_timeout_ms)
+            response = await response_info.value
+            if response.status in {401, 403, 429}:
+                self._network_blocked = True
+                raise BrowserBlocked("상점에서 로그인 또는 접근 제한을 알렸습니다.")
+            if response.status >= 400:
+                raise AmbiguousAdd("상점 응답을 장바구니에서 다시 확인해야 합니다.")
+            await self.page.wait_for_load_state("domcontentloaded", timeout=self.action_timeout_ms)
+            self._require_current_url()
+        except PlaywrightError as exc:
+            if self._write_blocked:
+                raise BrowserBlocked("장바구니 요청의 상품·옵션·수량이 확인 결과와 다릅니다.") from exc
+            if self._network_blocked:
+                raise BrowserBlocked("로그인 또는 승인 범위 밖으로 이동이 감지됐습니다.") from exc
+            raise AmbiguousAdd("담기 반영 여부를 장바구니에서 먼저 확인해야 합니다.") from exc
+        finally:
+            self._add_requests_left = 0
+            self._expected_write = None

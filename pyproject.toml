@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=70"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "zorocart"
+version = "0.1.0"
+description = "Zoro-1 shopping and cart verification agent"
+requires-python = ">=3.11"
+dependencies = [
+    "fastapi>=0.115,<1",
+    "httpx>=0.28,<0.29",
+    "playwright>=1.50,<2",
+    "pydantic>=2.9,<3",
+    "uvicorn>=0.34,<1",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8,<10"]
+
+[tool.setuptools.package-data]
+zorocart = ["dashboard.html"]
