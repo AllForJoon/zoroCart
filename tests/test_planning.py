@@ -66,3 +66,37 @@ def test_trida_choice_rejects_nonargmax_and_checkpoint_drift():
         asyncio.run(run("zoro-1"))
     with pytest.raises(ModelError, match="체크포인트"):
         asyncio.run(run("a" * 40))
+
+
+def test_guided_plan_records_quantity_and_owned_choices():
+    from zorocart.runner import Run, SCENARIOS
+
+    run = Run(SCENARIOS['pasta'])
+
+    def serve(request):
+        body = json.loads(request.content)
+        if request.url.path == '/v1/chat/completions':
+            prompt = body['messages'][-1]['content']
+            if prompt == run.request:
+                output = 'RECIPE'
+            else:
+                name = '스파게티면' if '마른 면' in prompt else '토마토 파스타 소스'
+                output = json.dumps({'name': name, 'reason': '2인분 조리용'}, ensure_ascii=False)
+            return httpx.Response(200, json={'choices': [{'message': {'content': output}, 'finish_reason': 'stop'}]})
+        answers = {}
+        for name, question in body['questions'].items():
+            choice = 'buy' if name == 'choice' else 'exclude'
+            answers[name] = {'type': 'choice', 'choice': choice,
+                             'probabilities': {key: float(key == choice) for key in question['criteria']}}
+        return httpx.Response(200, json={'answers': answers})
+
+    async def plan():
+        async with ZoroClient('http://localhost', transport=httpx.MockTransport(serve)) as client:
+            return await plan_purchase(client, run.request, run.event)
+
+    result = asyncio.run(plan())
+    assert [item.minimum_quantity for item in result.items] == [180, 240]
+    guidance = next(event for event in run.events if event['kind'] == 'plan_guidance')
+    assert guidance['route'] == 'recipe'
+    assert guidance['owned_items'] == ['올리브유', '소금', '마늘']
+    assert [event['model_choice'] for event in run.events if event.get('decision') == 'exclude'] == ['exclude'] * 3

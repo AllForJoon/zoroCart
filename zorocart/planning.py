@@ -306,7 +306,7 @@ async def plan_purchase(client: ZoroClient, request: str, event: Event | None = 
     uses = _known_uses(route, request, owned) if budget is not None and _guide_applies(route, request) else []
     if event and uses:
         event(
-            "plan_guidance", kind=route.lower(), owned_items=owned, explicit_budget=budget,
+            "plan_guidance", route=route.lower(), owned_items=owned, explicit_budget=budget,
             item_guidance=[
                 {"reference": use.reference, "purpose": use.purpose, "minimum_quantity": use.amount,
                  "minimum_unit": use.unit, "quantity_source": "planning_reference", "required": list(use.required)}
