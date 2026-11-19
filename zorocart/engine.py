@@ -420,19 +420,22 @@ class ShoppingEngine:
             candidates[:] = await self.select(updated, items, spent)
         return candidates
 
+    async def prepare_plan(self, request: str) -> None:
+        self.plan = await plan_purchase(self.client, request, self.event)
+        if self.plan.clarification and self.confirm:
+            reply = await self.confirm('clarification', self.plan.clarification)
+            if reply:
+                self.plan = await plan_purchase(self.client, f'{request}\n사용자의 확인 답변: {reply}', self.event)
+        if self.plan.clarification:
+            raise Hold(self.plan.clarification)
+        self.items = list(self.plan.items)
+        if not self.items:
+            raise Hold('구매할 품목이 확인되지 않았습니다.')
+        self.event('shopping_plan', plan=self.plan.model_dump())
+
     async def run(self, request: str) -> dict:
         try:
-            self.plan = await plan_purchase(self.client, request, self.event)
-            if self.plan.clarification and self.confirm:
-                reply = await self.confirm('clarification', self.plan.clarification)
-                if reply:
-                    self.plan = await plan_purchase(self.client, f'{request}\n사용자의 확인 답변: {reply}', self.event)
-            if self.plan.clarification:
-                raise Hold(self.plan.clarification)
-            self.items = list(self.plan.items)
-            if not self.items:
-                raise Hold('구매할 품목이 확인되지 않았습니다.')
-            self.event('shopping_plan', plan=self.plan.model_dump())
+            await self.prepare_plan(request)
             if self.search_only:
                 for item in self.items:
                     self.item = item

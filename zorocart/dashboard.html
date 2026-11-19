@@ -27,6 +27,7 @@
 <option value="local" selected>로컬 시연</option>
 <option value="coupang" disabled>쿠팡 실사이트 · 비로그인</option>
 <option value="naver">네이버플러스 스토어 · 비로그인</option>
+<option value="mcgrocer" disabled>McGrocer · 비회원</option>
 </select></label>
 <small id="environment-note" hidden>쿠팡 실사이트는 승인 범위와 전용 Chromium 프로필을 설정하면 열립니다.</small>
 <label for="request" class="subtle">필요한 품목, 수량, 예산이나 준비할 상황을 입력하세요.</label>
@@ -49,23 +50,25 @@ let runId=null;
 let coupangAvailable=false;
 let coupangWritesAvailable=false;
 const statusNames={complete:'장바구니 검증 완료',partial:'일부 품목 검증 완료',search_verified:'검색 확인 완료',held:'담기 보류',error:'실행 오류'};
-const titles={shopping_plan:'구매 계획 확정',cart_reset_started:'기존 장바구니 확인',cart_reset_verified:'빈 장바구니 확인',cart_reset_incomplete:'장바구니 초기화 보류',search_query:'검색어 생성',search_results_visible:'검색 화면 확인',cart_access_started:'장바구니 접근 확인',browser_action:'브라우저',cart_baseline:'담기 전 빈 장바구니 확인',cart_verification:'장바구니 수량 대조',add_uncertain:'담기 응답 확인 중',stale_observation:'화면 변경 후 재관찰',choice_recheck:'상품 근거 재확인',held:'실행 보류'};
-const environmentNames={coupang:'쿠팡 실사이트 · 비로그인',naver:'네이버플러스 스토어 · 비로그인'};
+const titles={shopping_plan:'구매 계획 확정',cart_reset_started:'기존 장바구니 확인',cart_reset_verified:'빈 장바구니 확인',cart_reset_incomplete:'장바구니 초기화 보류',search_query:'검색어 생성',store_catalog_read:'공식 판매 카탈로그 조회',store_cart_add:'비회원 장바구니 담기',search_results_visible:'검색 화면 확인',cart_access_started:'장바구니 접근 확인',browser_action:'브라우저',cart_baseline:'담기 전 빈 장바구니 확인',cart_verification:'장바구니 수량 대조',add_uncertain:'담기 응답 확인 중',stale_observation:'화면 변경 후 재관찰',choice_recheck:'상품 근거 재확인',held:'실행 보류'};
+const environmentNames={coupang:'쿠팡 실사이트 · 비로그인',naver:'네이버플러스 스토어 · 비로그인',mcgrocer:'McGrocer · 비회원'};
 const isSearchOnly=environment=>environment==='naver'||(environment==='coupang'&&!coupangWritesAvailable);
 const add=(parent,tag,content,className)=>{const node=document.createElement(tag);node.textContent=content;if(className)node.className=className;parent.append(node);return node;};
 const won=n=>new Intl.NumberFormat('ko-KR').format(n)+'원';
+const currency=(minor,code)=>new Intl.NumberFormat('en-GB',{style:'currency',currency:code}).format(minor/100);
 async function api(path, method='GET', body){const options={method,headers:{'X-ZoroCart-Token':token}};if(body){options.headers['Content-Type']='application/json';options.body=JSON.stringify(body);}const response=await fetch(path,options);if(!response.ok){const error=await response.json();throw new Error(typeof error.detail==='string'?error.detail:'요청에 실패했습니다.');}return response.json();}
 function showEnvironment(){
  const environment=$('environment').value;
  const naver=environment==='naver';
+ const mcgrocer=environment==='mcgrocer';
  const coupang=environment==='coupang';
  const searchOnly=isSearchOnly(environment);
  $('environment-badge').dataset.mode=environment;
  $('environment-badge').textContent=environmentNames[environment]||'로컬 시연 · 합성 상품 · 실제 Zoro-1';
- $('environment-note').hidden=!naver&&coupangAvailable&&(!coupang||coupangWritesAvailable);
- $('environment-note').textContent=naver?'Npay 장바구니를 사용하려면 네이버 로그인이 필요합니다.':coupangAvailable?'비로그인 장바구니의 삭제·담기 경로 확인이 필요합니다.':'쿠팡 실사이트는 승인 범위와 전용 브라우저 프로필을 설정하면 열립니다.';
- $('reset-policy').textContent=naver?`${browserName}에서 상품을 검색하고 장바구니 접근 여부를 확인합니다.`:searchOnly?`${browserName}에서 비로그인 검색 화면을 확인합니다.`:coupang?`${browserName}의 비로그인 장바구니를 비운 뒤 새 상품을 찾아 담습니다.`:'요청이 확정되면 기존 시연 장바구니를 비운 뒤 새 상품을 찾아 담습니다.';
- $('run-button').textContent=naver?'네이버플러스 스토어 비로그인 실행':coupang?(searchOnly?'쿠팡 비로그인 접속 확인':'쿠팡 장바구니 비우고 시작'):'장바구니 비우고 시작';
+ $('environment-note').hidden=!naver&&!mcgrocer&&coupangAvailable&&(!coupang||coupangWritesAvailable);
+ $('environment-note').textContent=mcgrocer?'영국 판매가를 사용합니다. 한국 배송은 확인되지 않았습니다.':naver?'Npay 장바구니를 사용하려면 네이버 로그인이 필요합니다.':coupangAvailable?'비로그인 장바구니의 삭제·담기 경로 확인이 필요합니다.':'쿠팡 실사이트는 승인 범위와 전용 브라우저 프로필을 설정하면 열립니다.';
+ $('reset-policy').textContent=mcgrocer?'상품과 예산을 확인한 뒤 비회원 장바구니를 비우고 요청한 수량을 담습니다.':naver?`${browserName}에서 상품을 검색하고 장바구니 접근 여부를 확인합니다.`:searchOnly?`${browserName}에서 비로그인 검색 화면을 확인합니다.`:coupang?`${browserName}의 비로그인 장바구니를 비운 뒤 새 상품을 찾아 담습니다.`:'요청이 확정되면 기존 시연 장바구니를 비운 뒤 새 상품을 찾아 담습니다.';
+ $('run-button').textContent=mcgrocer?'McGrocer 비회원 장바구니 실행':naver?'네이버플러스 스토어 비로그인 실행':coupang?(searchOnly?'쿠팡 비로그인 접속 확인':'쿠팡 장바구니 비우고 시작'):'장바구니 비우고 시작';
  $('demo-cart-link').hidden=environment!=='local';
 }
 function running(value){
@@ -101,9 +104,12 @@ function render(data){
    if(result.reason)add(display,'p',result.reason,'notice');
    running(false);return;
  }
- add(display,'div',won(result.merchandise_total),'money');add(display,'div','추가된 상품의 상품가 합계','subtle');
+ const money=result.store_money;
+ const verifiedMinor=money?result.added.reduce((sum,line)=>sum+line.store_total_minor,0):0;
+ add(display,'div',money?currency(verifiedMinor,money.currency):won(result.merchandise_total),'money');
+ add(display,'div',money?`추가된 상품가 합계 · 약 ${won(result.merchandise_total)} · ECB ${money.reference_date} 기준`:'추가된 상품의 상품가 합계','subtle');
  const rows=add(display,'ul','','rows');
- for(const line of result.added){const row=add(rows,'li','');add(row,'strong',line.title);add(row,'div',`${line.option} · 주문 ${line.quantity}개 · 단위당 구성 ${line.pack_count} · ${won(line.merchandise_total)}${line.delivery?' · '+line.delivery:''}`,'subtle');if(line.verified_attributes?.length)add(row,'small',line.verified_attributes.join(' · '));}
+ for(const line of result.added){const row=add(rows,'li','');add(row,'strong',line.title);add(row,'div',`${line.option} · 주문 ${line.quantity}개 · 단위당 구성 ${line.pack_count} · ${money?currency(line.store_total_minor,money.currency):won(line.merchandise_total)}${line.delivery?' · '+line.delivery:''}`,'subtle');if(line.verified_attributes?.length)add(row,'small',line.verified_attributes.join(' · '));}
  if(result.reason)add(display,'p',result.reason,'notice');
  if(result.remaining.length){const list=add(display,'ul','','rows');for(const item of result.remaining)add(list,'li',`${item.item} · ${item.reason}`);}
  running(false);
@@ -114,6 +120,6 @@ async function reply(answer){try{await api('/api/runs/'+runId+'/reply','POST',{a
 $('reply-form').addEventListener('submit',event=>{event.preventDefault();reply($('reply').value);});
 $('partial-buttons').addEventListener('click',event=>{if(event.target.dataset.answer)reply(event.target.dataset.answer);});
 $('environment').addEventListener('change',showEnvironment);
-api('/api/environments').then(({coupang_available,coupang_writes_available})=>{coupangAvailable=coupang_available;coupangWritesAvailable=coupang_writes_available;$('environment').querySelector('option[value=coupang]').disabled=!coupang_available;showEnvironment();}).catch(error=>{$('status').textContent=error.message;});
+api('/api/environments').then(({coupang_available,coupang_writes_available,mcgrocer_available})=>{coupangAvailable=coupang_available;coupangWritesAvailable=coupang_writes_available;$('environment').querySelector('option[value=coupang]').disabled=!coupang_available;$('environment').querySelector('option[value=mcgrocer]').disabled=!mcgrocer_available;showEnvironment();}).catch(error=>{$('status').textContent=error.message;});
 api('/api/scenarios').then(data=>{for(const [key,name] of Object.entries({household:'생활용품',pasta:'토마토 파스타',camping:'캠핑'})){const button=add($('scenarios'),'button',name);button.type='button';button.addEventListener('click',()=>{$('request').value=data[key];$('request').focus();});}}).catch(error=>{$('status').textContent=error.message;});
 </script></body></html>

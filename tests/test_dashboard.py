@@ -4,6 +4,7 @@ from fastapi.testclient import TestClient
 
 from zorocart import app as dashboard_app
 from zorocart.browser import NAVER_STORE_URL, CoupangApproval
+from zorocart.runner import MCGROCER_URL
 from zorocart.store import COOKIE
 
 STORE_URL = 'http://127.0.0.1:8780/store'
@@ -24,7 +25,7 @@ def test_dashboard_denies_unconfigured_coupang_before_scheduling(tmp_path, monke
     with TestClient(app) as client:
         headers = dashboard_headers(client)
         assert client.get('/api/environments', headers=headers).json() == {
-            'coupang_available': False, 'coupang_writes_available': False,
+            'coupang_available': False, 'coupang_writes_available': False, 'mcgrocer_available': False,
         }
         request = {'request': '무향 물티슈 한 팩 담아줘.', 'environment': 'coupang'}
         response = client.post('/api/runs', headers=headers, json=request)
@@ -47,18 +48,19 @@ def test_dashboard_starts_guest_runs_with_dedicated_profile_and_separate_demo_se
         desktop_ui=True,
     )
     profile = tmp_path / 'coupang-guest'
+    mcgrocer_state = tmp_path / 'mcgrocer-guest'
     monkeypatch.setattr(dashboard_app, 'execute_run', capture_run)
     app = dashboard_app.create_app(
         store_url=STORE_URL, log_dir=tmp_path, headless=True,
-        coupang_approval=approval, coupang_profile_dir=profile,
+        coupang_approval=approval, coupang_profile_dir=profile, mcgrocer_state_dir=mcgrocer_state,
     )
     with TestClient(app) as client:
         headers = dashboard_headers(client)
         assert client.get('/api/environments', headers=headers).json() == {
-            'coupang_available': True, 'coupang_writes_available': False,
+            'coupang_available': True, 'coupang_writes_available': False, 'mcgrocer_available': True,
         }
         demo_session = client.cookies.get(COOKIE)
-        for mode in ('coupang', 'naver', 'local', 'coupang'):
+        for mode in ('coupang', 'naver', 'mcgrocer', 'local', 'coupang'):
             response = client.post('/api/runs', headers=headers, json={
                 'request': '무향 물티슈 한 팩 담아줘.', 'environment': mode,
             })
@@ -79,4 +81,7 @@ def test_dashboard_starts_guest_runs_with_dedicated_profile_and_separate_demo_se
             'headless': True, 'interactive': True, 'demo_cart_session': demo_session,
         })
         naver = ('naver', NAVER_STORE_URL, {'headless': False, 'interactive': True})
-        assert calls == [live, naver, local, live]
+        mcgrocer = ('mcgrocer', MCGROCER_URL, {
+            'headless': False, 'interactive': True, 'mcgrocer_state_dir': mcgrocer_state,
+        })
+        assert calls == [live, naver, mcgrocer, local, live]

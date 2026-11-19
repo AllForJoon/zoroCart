@@ -16,6 +16,8 @@ from playwright.async_api import async_playwright
 from .browser import BrowserAdapter, CoupangApproval
 from .engine import ShoppingEngine
 from .model import ZoroClient
+from .shopify_live import MCGROCER_URL, ShopifyStore
+from .shopify_session import restore_cart, save_cart
 from .store import COOKIE as DEMO_CART_COOKIE
 
 CHECKPOINT = 'bf1b76b9b4df03b05fcbb73444e1cd4db0f566da'
@@ -99,10 +101,11 @@ class Run:
 
 async def execute_run(run: Run, store_url: str, *, headless=False, interactive=False,
                       timeout=420, max_steps=140, approval=None, profile_dir: Path | None = None,
-                      demo_cart_session: str | None = None):
+                      demo_cart_session: str | None = None, mcgrocer_state_dir: Path | None = None):
     engine = None
     browser_context = None
     naver_guest = run.environment == 'naver'
+    mcgrocer_guest = run.environment == 'mcgrocer'
     if run.environment == 'coupang':
         if approval is None or profile_dir is None or headless:
             raise ValueError('쿠팡 모드에는 쿠팡 승인 범위, 전용 프로필, 보이는 브라우저가 필요합니다.')
@@ -111,6 +114,9 @@ async def execute_run(run: Run, store_url: str, *, headless=False, interactive=F
         approval.validate()
     if naver_guest and (profile_dir is not None or approval is not None or headless):
         raise ValueError('네이버플러스 스토어는 새 비로그인 브라우저 세션에서 실행하세요.')
+    if mcgrocer_guest and (mcgrocer_state_dir is None or profile_dir is not None or approval is not None
+                           or headless or store_url != MCGROCER_URL):
+        raise ValueError('McGrocer는 전용 비회원 브라우저 세션에서 실행하세요.')
     if demo_cart_session is not None and run.environment != 'local':
         raise ValueError('시연 장바구니 세션은 로컬 상점에서만 사용할 수 있습니다.')
     native_read_only = bool(approval and approval.native_read_only)
@@ -144,8 +150,12 @@ async def execute_run(run: Run, store_url: str, *, headless=False, interactive=F
                 from .naver_live import NaverStoreAdapter
 
                 adapter_class = NaverStoreAdapter
-            adapter = adapter_class(page, store_url, mode=run.environment, approval=approval,
-                                    max_steps=max_steps, deadline=deadline)
+            if mcgrocer_guest:
+                await restore_cart(browser_context, mcgrocer_state_dir)
+                adapter = ShopifyStore(page)
+            else:
+                adapter = adapter_class(page, store_url, mode=run.environment, approval=approval,
+                                        max_steps=max_steps, deadline=deadline)
             if demo_cart_session is not None:
                 origin = urlsplit(adapter.home_url)
                 await browser_context.add_cookies([{'name': DEMO_CART_COOKIE, 'value': demo_cart_session,
@@ -157,12 +167,20 @@ async def execute_run(run: Run, store_url: str, *, headless=False, interactive=F
                                   timeout=min(150, timeout)) as client:
                 run.event('run_started', checkpoint=os.environ.get('ZORO_MODEL', CHECKPOINT),
                           reference_serving_commit=SERVING_COMMIT, visible_browser=not headless)
-                engine = ShoppingEngine(client, adapter, run.event, confirm=run.ask if interactive else None,
-                                        score_threshold=float(os.environ.get('ZOROCART_MIN_SCORE', '2.5')),
-                                        choice_threshold=float(os.environ.get('ZOROCART_MIN_PROBABILITY', '0.70')),
-                                        search_only=native_read_only or naver_guest,
-                                        check_cart_after_search=naver_guest)
+                engine_options = {'confirm': run.ask if interactive else None,
+                                  'score_threshold': float(os.environ.get('ZOROCART_MIN_SCORE', '2.5')),
+                                  'choice_threshold': float(os.environ.get('ZOROCART_MIN_PROBABILITY', '0.70'))}
+                if mcgrocer_guest:
+                    from .shopify_engine import ShopifyShoppingEngine
+
+                    engine = ShopifyShoppingEngine(client, adapter, run.event, **engine_options)
+                else:
+                    engine = ShoppingEngine(client, adapter, run.event, **engine_options,
+                                            search_only=native_read_only or naver_guest,
+                                            check_cart_after_search=naver_guest)
                 run.result = await engine.run(run.request)
+            if mcgrocer_guest:
+                await save_cart(browser_context, mcgrocer_state_dir)
             await browser_context.close()
             if browser_instance:
                 await browser_instance.close()

@@ -12,13 +12,13 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
 
 from .browser import NAVER_STORE_URL, CoupangApproval
-from .runner import Run, SCENARIOS, execute_run
+from .runner import MCGROCER_URL, Run, SCENARIOS, execute_run
 from .store import get_session, router, with_session
 
 
 class NewRun(BaseModel):
     request: str = Field(min_length=1, max_length=1800)
-    environment: Literal['local', 'coupang', 'naver'] = 'local'
+    environment: Literal['local', 'coupang', 'naver', 'mcgrocer'] = 'local'
 
 
 class RunReply(BaseModel):
@@ -27,7 +27,8 @@ class RunReply(BaseModel):
 
 def create_app(*, store_url: str, log_dir: Path, headless: bool = False,
                coupang_approval: CoupangApproval | None = None,
-               coupang_profile_dir: Path | None = None) -> FastAPI:
+               coupang_profile_dir: Path | None = None,
+               mcgrocer_state_dir: Path | None = None) -> FastAPI:
     if (coupang_approval is None) != (coupang_profile_dir is None):
         raise ValueError('쿠팡 모드를 열려면 승인 범위와 전용 브라우저 프로필을 함께 지정하세요.')
     if coupang_approval is not None:
@@ -79,7 +80,8 @@ def create_app(*, store_url: str, log_dir: Path, headless: bool = False,
     async def environments(request: Request):
         authorized(request)
         return {'coupang_available': coupang_approval is not None,
-                'coupang_writes_available': bool(coupang_approval and coupang_approval.can_write)}
+                'coupang_writes_available': bool(coupang_approval and coupang_approval.can_write),
+                'mcgrocer_available': mcgrocer_state_dir is not None}
 
     @app.post('/api/runs', status_code=202)
     async def start_run(data: NewRun, request: Request):
@@ -90,6 +92,8 @@ def create_app(*, store_url: str, log_dir: Path, headless: bool = False,
             raise HTTPException(422, '쇼핑 요청을 입력하세요.')
         if data.environment == 'coupang' and coupang_approval is None:
             raise HTTPException(403, '쿠팡 승인 범위와 전용 브라우저 프로필이 설정되어 있지 않습니다.')
+        if data.environment == 'mcgrocer' and mcgrocer_state_dir is None:
+            raise HTTPException(403, 'McGrocer 비회원 장바구니 저장 경로가 설정되어 있지 않습니다.')
         if len(runs) >= 40:
             del runs[next(iter(runs))]
         cart_session = get_session(request)[0] if data.environment == 'local' else None
@@ -105,6 +109,9 @@ def create_app(*, store_url: str, log_dir: Path, headless: bool = False,
                     )
                 elif run.environment == 'naver':
                     await execute_run(run, NAVER_STORE_URL, headless=False, interactive=True)
+                elif run.environment == 'mcgrocer':
+                    await execute_run(run, MCGROCER_URL, headless=False, interactive=True,
+                                      mcgrocer_state_dir=mcgrocer_state_dir)
                 else:
                     await execute_run(run, store_url, headless=headless, interactive=True,
                                       demo_cart_session=cart_session)

@@ -44,5 +44,9 @@ python -m pytest -q
 
 대시보드에서 **네이버플러스 스토어 · 비로그인**을 선택하면 새 브라우저 세션에서 Zoro-1이 요청을 해석하고 스토어의 검색 화면을 사용합니다. 검색 후 장바구니 접근 여부를 확인합니다. 네이버 로그인 화면이 나타나면 실행을 보류하고 장바구니 초기화와 상품 추가 현황을 표시합니다. [네이버 장바구니 이용 안내](https://help.pay.naver.com/faq/content.help?faqId=11639)
 
+## McGrocer
+
+`serve --mcgrocer-state-dir private/mcgrocer-cart`로 **McGrocer · 비회원** 모드를 열 수 있습니다. Zoro-1은 한국어 요청에서 영어 검색어를 생성하고 공식 Shopify 카탈로그의 후보를 평가합니다. 전용 비회원 장바구니를 비운 뒤 선택한 옵션과 수량을 담고, 장바구니 API로 재조회합니다. 새 Chrome 실행 사이에는 비회원 장바구니 쿠키만 보존합니다. 결과에는 파운드 상품가와 ECB 기준 원화 환산액이 표시됩니다. 한국 배송 가능 여부는 확인되지 않았습니다. [판매처의 UCP 프로필](https://mcgrocer.com/.well-known/ucp) · [Shopify 장바구니 API](https://shopify.dev/docs/api/ajax/reference/cart)
+
 - [Trida Stack decide API](https://github.com/trillion-labs/trida-stack/blob/0ddcf516e458a82892d7fe0d0dabeb113d3cf424/inference/zoro-1/README.md#decisions)
 - [Jev Ultrafast 행동 공간](https://github.com/browser-use/jev-ultrafast#the-action-space)

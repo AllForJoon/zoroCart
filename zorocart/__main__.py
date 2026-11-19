@@ -26,6 +26,7 @@ def options() -> argparse.Namespace:
     serve.add_argument('--log-dir', type=Path, default=Path('logs'))
     serve.add_argument('--coupang-approval', type=Path, help='쿠팡 승인 범위와 화면 설정 파일')
     serve.add_argument('--profile-dir', type=Path, help='쿠팡 비로그인 전용 Chromium 프로필')
+    serve.add_argument('--mcgrocer-state-dir', type=Path, help='McGrocer 비회원 장바구니 상태 저장 경로')
     run = commands.add_parser('run', help='브라우저 실행 및 JSON 로그 저장')
     source = run.add_mutually_exclusive_group(required=True)
     source.add_argument('--request')
@@ -164,7 +165,8 @@ def main():
         approval = CoupangApproval.from_file(args.coupang_approval) if args.coupang_approval else None
         uvicorn.run(create_app(store_url=f'http://127.0.0.1:{args.port}/store', log_dir=args.log_dir,
                                headless=args.headless, coupang_approval=approval,
-                               coupang_profile_dir=args.profile_dir),
+                               coupang_profile_dir=args.profile_dir,
+                               mcgrocer_state_dir=args.mcgrocer_state_dir),
                     host='127.0.0.1', port=args.port, access_log=False)
     else:
         raise SystemExit(asyncio.run(command(args)))
