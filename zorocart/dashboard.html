@@ -26,6 +26,7 @@
 <select id="environment" aria-describedby="environment-note">
 <option value="local" selected>로컬 시연</option>
 <option value="coupang" disabled>쿠팡 실사이트 · 비로그인</option>
+<option value="naver">네이버플러스 스토어 · 비로그인</option>
 </select></label>
 <small id="environment-note" hidden>쿠팡 실사이트는 승인 범위와 전용 Chromium 프로필을 설정하면 열립니다.</small>
 <label for="request" class="subtle">필요한 품목, 수량, 예산이나 준비할 상황을 입력하세요.</label>
@@ -48,30 +49,36 @@ let runId=null;
 let coupangAvailable=false;
 let coupangWritesAvailable=false;
 const statusNames={complete:'장바구니 검증 완료',partial:'일부 품목 검증 완료',search_verified:'검색 확인 완료',held:'담기 보류',error:'실행 오류'};
-const titles={shopping_plan:'구매 계획 확정',cart_reset_started:'기존 장바구니 확인',cart_reset_verified:'빈 장바구니 확인',cart_reset_incomplete:'장바구니 초기화 보류',search_query:'검색어 생성',search_results_visible:'검색 화면 확인',browser_action:'브라우저',cart_baseline:'담기 전 빈 장바구니 확인',cart_verification:'장바구니 수량 대조',add_uncertain:'담기 응답 확인 중',stale_observation:'화면 변경 후 재관찰',choice_recheck:'상품 근거 재확인',held:'실행 보류'};
+const titles={shopping_plan:'구매 계획 확정',cart_reset_started:'기존 장바구니 확인',cart_reset_verified:'빈 장바구니 확인',cart_reset_incomplete:'장바구니 초기화 보류',search_query:'검색어 생성',search_results_visible:'검색 화면 확인',cart_access_started:'장바구니 접근 확인',browser_action:'브라우저',cart_baseline:'담기 전 빈 장바구니 확인',cart_verification:'장바구니 수량 대조',add_uncertain:'담기 응답 확인 중',stale_observation:'화면 변경 후 재관찰',choice_recheck:'상품 근거 재확인',held:'실행 보류'};
+const environmentNames={coupang:'쿠팡 실사이트 · 비로그인',naver:'네이버플러스 스토어 · 비로그인'};
+const isSearchOnly=environment=>environment==='naver'||(environment==='coupang'&&!coupangWritesAvailable);
 const add=(parent,tag,content,className)=>{const node=document.createElement(tag);node.textContent=content;if(className)node.className=className;parent.append(node);return node;};
 const won=n=>new Intl.NumberFormat('ko-KR').format(n)+'원';
 async function api(path, method='GET', body){const options={method,headers:{'X-ZoroCart-Token':token}};if(body){options.headers['Content-Type']='application/json';options.body=JSON.stringify(body);}const response=await fetch(path,options);if(!response.ok){const error=await response.json();throw new Error(typeof error.detail==='string'?error.detail:'요청에 실패했습니다.');}return response.json();}
 function showEnvironment(){
- const live=$('environment').value==='coupang';
- $('environment-badge').dataset.mode=live?'coupang':'local';
- $('environment-badge').textContent=live?'쿠팡 실사이트 · 비로그인':'로컬 시연 · 합성 상품 · 실제 Zoro-1';
- $('environment-note').hidden=coupangAvailable&&(!live||coupangWritesAvailable);
- $('environment-note').textContent=coupangAvailable?'비로그인 장바구니의 삭제·담기 경로 확인이 필요합니다.':'쿠팡 실사이트는 승인 범위와 전용 Chromium 프로필을 설정하면 열립니다.';
- $('reset-policy').textContent=live?(coupangWritesAvailable?`${browserName}의 비로그인 장바구니를 비운 뒤 새 상품을 찾아 담습니다.`:`${browserName}에서 비로그인 검색 화면을 확인합니다.`):'요청이 확정되면 기존 시연 장바구니를 비운 뒤 새 상품을 찾아 담습니다.';
- $('run-button').textContent=live?(coupangWritesAvailable?'쿠팡 장바구니 비우고 시작':'쿠팡 비로그인 접속 확인'):'장바구니 비우고 시작';
- $('demo-cart-link').hidden=live;
+ const environment=$('environment').value;
+ const naver=environment==='naver';
+ const coupang=environment==='coupang';
+ const searchOnly=isSearchOnly(environment);
+ $('environment-badge').dataset.mode=environment;
+ $('environment-badge').textContent=environmentNames[environment]||'로컬 시연 · 합성 상품 · 실제 Zoro-1';
+ $('environment-note').hidden=!naver&&coupangAvailable&&(!coupang||coupangWritesAvailable);
+ $('environment-note').textContent=naver?'Npay 장바구니를 사용하려면 네이버 로그인이 필요합니다.':coupangAvailable?'비로그인 장바구니의 삭제·담기 경로 확인이 필요합니다.':'쿠팡 실사이트는 승인 범위와 전용 브라우저 프로필을 설정하면 열립니다.';
+ $('reset-policy').textContent=naver?`${browserName}에서 상품을 검색하고 장바구니 접근 여부를 확인합니다.`:searchOnly?`${browserName}에서 비로그인 검색 화면을 확인합니다.`:coupang?`${browserName}의 비로그인 장바구니를 비운 뒤 새 상품을 찾아 담습니다.`:'요청이 확정되면 기존 시연 장바구니를 비운 뒤 새 상품을 찾아 담습니다.';
+ $('run-button').textContent=naver?'네이버플러스 스토어 비로그인 실행':coupang?(searchOnly?'쿠팡 비로그인 접속 확인':'쿠팡 장바구니 비우고 시작'):'장바구니 비우고 시작';
+ $('demo-cart-link').hidden=environment!=='local';
 }
 function running(value){
  $('run-button').disabled=value;$('environment').disabled=value;
 }
 function render(data){
  const {result,events,metrics,pending,environment}=data;
- const searchOnly=environment==='coupang'&&!coupangWritesAvailable;
- $('outcome-heading').textContent=searchOnly?'쿠팡 검색 결과':'이번 실행에서 확인한 장바구니';
- $('status').textContent=result?(searchOnly&&result.status==='held'?'조회 보류':statusNames[result.status]):pending?'사용자 확인 대기 중':'실행 중';
+ const naver=environment==='naver';
+ const searchOnly=isSearchOnly(environment);
+ $('outcome-heading').textContent=naver?'네이버플러스 스토어 결과':searchOnly?'쿠팡 검색 결과':'이번 실행에서 확인한 장바구니';
+ $('status').textContent=result?(searchOnly&&!naver&&result.status==='held'?'조회 보류':statusNames[result.status]):pending?'사용자 확인 대기 중':'실행 중';
  $('run-environment').hidden=false;
- $('run-environment').textContent=environment==='coupang'?'쿠팡 실사이트 · 비로그인':'로컬 시연 실행';
+ $('run-environment').textContent=environmentNames[environment]||'로컬 시연 실행';
  const reset=events.find(e=>e.kind==='cart_reset_verified');
  const resetStarted=events.find(e=>e.kind==='cart_reset_started');
  $('reset-status').hidden=!resetStarted;
@@ -90,6 +97,7 @@ function render(data){
  if(searchOnly){
    const searches=events.filter(e=>e.kind==='search_results_visible');
    if(searches.length){const list=add(display,'ul','','rows');for(const e of searches)add(list,'li',`‘${e.query}’ 검색 화면을 열고 상품 카드 ${e.inspected_cards}개를 읽었습니다.`);}
+   if(naver)add(display,'p','장바구니 초기화 미실행 · 이번 실행 추가 0종','subtle');
    if(result.reason)add(display,'p',result.reason,'notice');
    running(false);return;
  }
@@ -101,7 +109,7 @@ function render(data){
  running(false);
 }
 async function poll(){try{const data=await api('/api/runs/'+runId);render(data);if(!data.result)setTimeout(poll,800);}catch(error){$('status').textContent=error.message;running(false);}}
-$('request-form').addEventListener('submit',async event=>{event.preventDefault();const environment=$('environment').value;running(true);$('status').textContent='실행 준비 중';try{const response=await api('/api/runs','POST',{request:$('request').value,environment});runId=response.id;$('reset-status').hidden=true;$('reset-status').textContent='';const searchOnly=environment==='coupang'&&!coupangWritesAvailable;$('result').textContent=searchOnly?'상품 검색 화면을 확인하고 있습니다.':'장바구니를 확인할 때까지 기다려 주세요.';poll();}catch(error){$('status').textContent=error.message;running(false);}});
+$('request-form').addEventListener('submit',async event=>{event.preventDefault();const environment=$('environment').value;running(true);$('status').textContent='실행 준비 중';try{const response=await api('/api/runs','POST',{request:$('request').value,environment});runId=response.id;$('reset-status').hidden=true;$('reset-status').textContent='';$('result').textContent=isSearchOnly(environment)?'상품 검색 화면을 확인하고 있습니다.':'장바구니를 확인할 때까지 기다려 주세요.';poll();}catch(error){$('status').textContent=error.message;running(false);}});
 async function reply(answer){try{await api('/api/runs/'+runId+'/reply','POST',{answer});$('confirm').hidden=true;$('reply').value='';}catch(error){$('confirm-message').textContent=error.message;}}
 $('reply-form').addEventListener('submit',event=>{event.preventDefault();reply($('reply').value);});
 $('partial-buttons').addEventListener('click',event=>{if(event.target.dataset.answer)reply(event.target.dataset.answer);});

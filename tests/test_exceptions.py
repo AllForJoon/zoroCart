@@ -15,7 +15,7 @@ from fastapi import FastAPI, Request
 from playwright.async_api import async_playwright
 
 from zorocart import store
-from zorocart.browser import BrowserAdapter
+from zorocart.browser import BrowserAdapter, BrowserBlocked
 from zorocart.engine import ShoppingEngine
 from zorocart.model import ModelResponseError, ZoroClient
 from zorocart.runner import Run, SCENARIOS
@@ -135,7 +135,13 @@ async def running_store():
             await task
 
 
-async def exercise(fault: str, *, confirmation=None, draft=PLAN, search_only: bool = False):
+class LoginRequiredCart(BrowserAdapter):
+    async def open_cart(self):
+        raise BrowserBlocked("장바구니를 사용하려면 로그인이 필요합니다.")
+
+
+async def exercise(fault: str, *, confirmation=None, draft=PLAN, search_only: bool = False,
+                   check_cart_after_search: bool = False):
     run = Run(SCENARIOS["household"], environment="offline-test")
     async with running_store() as (origin, writes), async_playwright() as pw:
         async def confirm(kind: str, message: str):
@@ -148,13 +154,15 @@ async def exercise(fault: str, *, confirmation=None, draft=PLAN, search_only: bo
             context = await browser.new_context(service_workers="block")
             page = await context.new_page()
             store_url = f"{origin}/store" + (f"?fault={fault}" if fault else "")
-            adapter = BrowserAdapter(page, store_url, action_timeout_ms=1500)
+            adapter_type = LoginRequiredCart if check_cart_after_search else BrowserAdapter
+            adapter = adapter_type(page, store_url, action_timeout_ms=1500)
             transport = httpx.MockTransport(OfflineZoro(fault, draft).respond)
             async with ZoroClient("http://model.invalid", transport=transport, event=run.event) as model:
                 engine = ShoppingEngine(
                     model, adapter, run.event,
                     confirm=confirm if confirmation is not None else None,
                     search_only=search_only,
+                    check_cart_after_search=check_cart_after_search,
                 )
                 try:
                     result = await engine.run(run.request)
@@ -164,7 +172,7 @@ async def exercise(fault: str, *, confirmation=None, draft=PLAN, search_only: bo
                     result = error
             cart = None
             if fault != "blocked":
-                await adapter.open_cart()
+                await BrowserAdapter.open_cart(adapter)
                 cart = {
                     (line.product_id, line.option_id): line.quantity
                     for line in await adapter.read_cart()
@@ -198,6 +206,20 @@ def test_search_only_holds_when_both_queries_lack_readable_cards(monkeypatch):
     assert "상품 카드" in result["reason"]
     assert [event["retry"] for event in events if event["kind"] == "search_query"] == [False, True]
     assert not any(event["kind"] == "search_results_visible" for event in events)
+    assert not writes
+    assert cart == BASELINE
+
+
+def test_guest_run_reports_login_after_search_without_resetting_or_adding():
+    result, events, cart, writes = asyncio.run(exercise("", search_only=True, check_cart_after_search=True))
+
+    assert result["status"] == "held"
+    assert "로그인" in result["reason"]
+    assert result["cart_reset"] is None
+    assert not result["added"]
+    stages = [event["kind"] for event in events]
+    assert stages.count("search_results_visible") == 2
+    assert stages[-2:] == ["cart_access_started", "held"]
     assert not writes
     assert cart == BASELINE
 

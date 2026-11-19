@@ -40,5 +40,9 @@ python -m pytest -q
 
 승인된 쿠팡 환경은 [쿠팡 연동 설정](docs/coupang.md)을 따릅니다. 합성 상점 검증과 별개로 승인 범위에서 실제 DOM과 장바구니 요청 형식을 확인해야 합니다. 공식 장바구니 API를 지원하는 대안은 [쇼핑 API 후보](docs/shopping-apis.md)에 정리했습니다.
 
+## 네이버플러스 스토어
+
+대시보드에서 **네이버플러스 스토어 · 비로그인**을 선택하면 새 브라우저 세션에서 Zoro-1이 요청을 해석하고 스토어의 검색 화면을 사용합니다. 검색 후 장바구니 접근 여부를 확인합니다. 네이버 로그인 화면이 나타나면 실행을 보류하고 장바구니 초기화와 상품 추가 현황을 표시합니다. [네이버 장바구니 이용 안내](https://help.pay.naver.com/faq/content.help?faqId=11639)
+
 - [Trida Stack decide API](https://github.com/trillion-labs/trida-stack/blob/0ddcf516e458a82892d7fe0d0dabeb113d3cf424/inference/zoro-1/README.md#decisions)
 - [Jev Ultrafast 행동 공간](https://github.com/browser-use/jev-ultrafast#the-action-space)

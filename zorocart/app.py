@@ -11,14 +11,14 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
 
-from .browser import CoupangApproval
+from .browser import NAVER_STORE_URL, CoupangApproval
 from .runner import Run, SCENARIOS, execute_run
 from .store import get_session, router, with_session
 
 
 class NewRun(BaseModel):
     request: str = Field(min_length=1, max_length=1800)
-    environment: Literal['local', 'coupang'] = 'local'
+    environment: Literal['local', 'coupang', 'naver'] = 'local'
 
 
 class RunReply(BaseModel):
@@ -88,22 +88,23 @@ def create_app(*, store_url: str, log_dir: Path, headless: bool = False,
             raise HTTPException(409, '현재 진행 중인 실행이 끝난 뒤 다시 시도하세요.')
         if not data.request.strip():
             raise HTTPException(422, '쇼핑 요청을 입력하세요.')
-        live = data.environment == 'coupang'
-        if live and coupang_approval is None:
+        if data.environment == 'coupang' and coupang_approval is None:
             raise HTTPException(403, '쿠팡 승인 범위와 전용 브라우저 프로필이 설정되어 있지 않습니다.')
         if len(runs) >= 40:
             del runs[next(iter(runs))]
-        cart_session = None if live else get_session(request)[0]
+        cart_session = get_session(request)[0] if data.environment == 'local' else None
         run = Run(data.request.strip(), environment=data.environment)
         runs[run.id] = run
 
         async def work():
             try:
-                if live:
+                if run.environment == 'coupang':
                     await execute_run(
                         run, coupang_approval.home_url, headless=False, interactive=True,
                         approval=coupang_approval, profile_dir=coupang_profile_dir,
                     )
+                elif run.environment == 'naver':
+                    await execute_run(run, NAVER_STORE_URL, headless=False, interactive=True)
                 else:
                     await execute_run(run, store_url, headless=headless, interactive=True,
                                       demo_cart_session=cart_session)

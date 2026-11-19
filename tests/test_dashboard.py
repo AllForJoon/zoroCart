@@ -3,7 +3,7 @@ import re
 from fastapi.testclient import TestClient
 
 from zorocart import app as dashboard_app
-from zorocart.browser import CoupangApproval
+from zorocart.browser import NAVER_STORE_URL, CoupangApproval
 from zorocart.store import COOKIE
 
 STORE_URL = 'http://127.0.0.1:8780/store'
@@ -36,7 +36,8 @@ def test_dashboard_starts_guest_runs_with_dedicated_profile_and_separate_demo_se
 
     async def capture_run(run, store_url, **settings):
         calls.append((run.environment, store_url, settings))
-        run.result = {'status': 'complete', 'added': [], 'remaining': []}
+        run.result = {'status': 'held' if run.environment == 'naver' else 'complete',
+                      'cart_reset': None, 'added': [], 'remaining': []}
 
     approval = CoupangApproval(
         reference='offline-dashboard-routing',
@@ -57,14 +58,19 @@ def test_dashboard_starts_guest_runs_with_dedicated_profile_and_separate_demo_se
             'coupang_available': True, 'coupang_writes_available': False,
         }
         demo_session = client.cookies.get(COOKIE)
-        for mode in ('coupang', 'local', 'coupang'):
+        for mode in ('coupang', 'naver', 'local', 'coupang'):
             response = client.post('/api/runs', headers=headers, json={
                 'request': '무향 물티슈 한 팩 담아줘.', 'environment': mode,
             })
             assert response.status_code == 202
             artifact = client.get('/api/runs/' + response.json()['id'], headers=headers).json()
             assert artifact['environment'] == mode
-            assert artifact['result']['status'] == 'complete'
+            if mode == 'naver':
+                assert artifact['result']['status'] == 'held'
+                assert artifact['result']['cart_reset'] is None
+                assert not artifact['result']['added']
+            else:
+                assert artifact['result']['status'] == 'complete'
         assert demo_session and client.cookies.get(COOKIE) == demo_session
         live = ('coupang', approval.home_url, {
             'headless': False, 'interactive': True, 'approval': approval, 'profile_dir': profile,
@@ -72,4 +78,5 @@ def test_dashboard_starts_guest_runs_with_dedicated_profile_and_separate_demo_se
         local = ('local', STORE_URL, {
             'headless': True, 'interactive': True, 'demo_cart_session': demo_session,
         })
-        assert calls == [live, local, live]
+        naver = ('naver', NAVER_STORE_URL, {'headless': False, 'interactive': True})
+        assert calls == [live, naver, local, live]

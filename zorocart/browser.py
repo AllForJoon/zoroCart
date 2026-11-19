@@ -14,6 +14,8 @@ from playwright.async_api import ElementHandle, Error as PlaywrightError, Page, 
 
 from .coupang_evidence import parse_pack, parse_price, parse_quantity
 
+NAVER_STORE_URL = "https://shopping.naver.com/ns/home"
+
 CONTROL_ACTIONS = {
     "search-input": "TYPE_TEXT",
     "search-submit": "CLICK",
@@ -549,6 +551,19 @@ class BrowserAdapter:
             self._read_scopes = {_origin(parsed): self._read_paths}
             self._write_origins = {self._add_path: _origin(parsed), self._clear_path: _origin(parsed)}
             self._dom = LOCAL_DOM
+        elif mode == "naver":
+            if store_url != NAVER_STORE_URL or approval is not None:
+                raise BrowserBlocked("네이버플러스 스토어 실행에는 공식 홈 주소가 필요합니다.")
+            self.home_url = NAVER_STORE_URL
+            self.cart_url = ""
+            self._read_scopes = {
+                _origin(urlsplit(NAVER_STORE_URL)): (r"/ns/home",),
+                _origin(urlsplit("https://search.shopping.naver.com")): (r"/ns/search",),
+            }
+            self._add_path = self._add_fields = None
+            self._clear_path = self._clear_items_field = None
+            self._write_origins = {}
+            self._dom = {}
         elif mode == "coupang" and approval:
             if not isinstance(approval, CoupangApproval):
                 approval = CoupangApproval.from_file(approval)

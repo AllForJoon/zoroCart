@@ -102,12 +102,15 @@ async def execute_run(run: Run, store_url: str, *, headless=False, interactive=F
                       demo_cart_session: str | None = None):
     engine = None
     browser_context = None
+    naver_guest = run.environment == 'naver'
     if run.environment == 'coupang':
         if approval is None or profile_dir is None or headless:
             raise ValueError('쿠팡 모드에는 쿠팡 승인 범위, 전용 프로필, 보이는 브라우저가 필요합니다.')
         if not isinstance(approval, CoupangApproval):
             approval = CoupangApproval.from_file(approval)
         approval.validate()
+    if naver_guest and (profile_dir is not None or approval is not None or headless):
+        raise ValueError('네이버플러스 스토어는 새 비로그인 브라우저 세션에서 실행하세요.')
     if demo_cart_session is not None and run.environment != 'local':
         raise ValueError('시연 장바구니 세션은 로컬 상점에서만 사용할 수 있습니다.')
     native_read_only = bool(approval and approval.native_read_only)
@@ -127,7 +130,7 @@ async def execute_run(run: Run, store_url: str, *, headless=False, interactive=F
                 browser_instance = None
             else:
                 browser_instance = await pw.chromium.launch(**options)
-                browser_context = await browser_instance.new_context(service_workers='block')
+                browser_context = await browser_instance.new_context(service_workers='allow' if naver_guest else 'block')
             page = await browser_context.new_page()
             for existing in browser_context.pages:
                 if existing != page:
@@ -137,6 +140,10 @@ async def execute_run(run: Run, store_url: str, *, headless=False, interactive=F
                 from .coupang_live import CoupangDesktopAdapter
 
                 adapter_class = CoupangDesktopAdapter
+            elif naver_guest:
+                from .naver_live import NaverStoreAdapter
+
+                adapter_class = NaverStoreAdapter
             adapter = adapter_class(page, store_url, mode=run.environment, approval=approval,
                                     max_steps=max_steps, deadline=deadline)
             if demo_cart_session is not None:
@@ -153,13 +160,15 @@ async def execute_run(run: Run, store_url: str, *, headless=False, interactive=F
                 engine = ShoppingEngine(client, adapter, run.event, confirm=run.ask if interactive else None,
                                         score_threshold=float(os.environ.get('ZOROCART_MIN_SCORE', '2.5')),
                                         choice_threshold=float(os.environ.get('ZOROCART_MIN_PROBABILITY', '0.70')),
-                                        search_only=native_read_only)
+                                        search_only=native_read_only or naver_guest,
+                                        check_cart_after_search=naver_guest)
                 run.result = await engine.run(run.request)
             await browser_context.close()
             if browser_instance:
                 await browser_instance.close()
     except TimeoutError:
-        reason = '실행 제한 시간에 도달했습니다. 마지막으로 확인한 장바구니 결과를 표시합니다.'
+        reason = ('실행 제한 시간에 도달했습니다. 마지막으로 확인한 검색 결과를 표시합니다.'
+                  if naver_guest else '실행 제한 시간에 도달했습니다. 마지막으로 확인한 장바구니 결과를 표시합니다.')
         run.event('run_timeout', reason=reason)
         if engine:
             run.result = engine.result('partial' if engine.verified else 'held', reason)

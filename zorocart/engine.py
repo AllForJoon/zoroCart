@@ -92,13 +92,14 @@ class ShoppingEngine:
     def __init__(self, client: ZoroClient, browser: BrowserAdapter, event: Callable, *,
                  score_threshold: float = 2.5, choice_threshold: float = 0.70,
                  confirm: Callable[[str, str], Awaitable[str | None]] | None = None,
-                 search_only: bool = False):
+                 search_only: bool = False, check_cart_after_search: bool = False):
         if not 0 <= score_threshold <= 4 or not 0 <= choice_threshold <= 1:
             raise ValueError('상품 점수 임계값은 0~4, 선택 확률 임계값은 0~1이어야 합니다.')
         self.client, self.browser, self.event = client, browser, event
         self.score_threshold, self.choice_threshold = score_threshold, choice_threshold
         self.confirm = confirm
         self.search_only = search_only
+        self.check_cart_after_search = check_cart_after_search
         self.cart_reset: dict | None = None
         self.previous: dict[str, Any] | None = None
         self.selections: dict[tuple, Candidate] = {}
@@ -442,6 +443,10 @@ class ShoppingEngine:
                         raise Hold(f'{item.name}의 검색 결과에서 상품 카드를 확인할 수 없습니다.')
                     self.event('search_results_visible', item=item.name, query=query,
                                inspected_cards=len(cards))
+                if self.check_cart_after_search:
+                    self.event('cart_access_started')
+                    await self.browser.open_cart()
+                    raise Hold('이 비로그인 모드에서는 장바구니 화면 조회까지만 지원합니다.')
                 return self.result('search_verified')
             await self.reset_cart()
             groups = []
