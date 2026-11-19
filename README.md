@@ -20,7 +20,16 @@ python -m zorocart serve --port 8765
 
 [로컬 대시보드](http://127.0.0.1:8765/)에서 자연어 요청을 입력하거나 시연 입력을 선택한 뒤 **장바구니 비우고 시작**을 누릅니다. 유효한 계획이 확정되면 현재 시연 장바구니를 비웁니다. 보이는 Chromium 창에서 합성 상품을 검색하고, 대시보드에 진행 상황과 장바구니 검증 결과를 표시합니다. **시연 장바구니 보기**에서 같은 브라우저 세션의 현재 장바구니를 확인할 수 있습니다. 설치된 Chrome을 쓰려면 `ZOROCART_CHROMIUM_CHANNEL=chrome`을 설정합니다.
 
-팀 Brev에서 확인한 체크포인트는 `bf1b76b9b4df03b05fcbb73444e1cd4db0f566da`, Trida Stack 커밋은 `0ddcf516e458a82892d7fe0d0dabeb113d3cf424`입니다. 팀 서버 가이드의 런타임은 SGLang 0.5.23입니다. 연결 주소와 모델은 `ZORO_URL`, `ZORO_MODEL`로 바꿀 수 있습니다. 기본 임계값은 Score 2.5와 Choice 확률 0.70이고 `ZOROCART_MIN_SCORE`, `ZOROCART_MIN_PROBABILITY`로 설정합니다.
+팀 Brev에서 확인한 체크포인트는 `bf1b76b9b4df03b05fcbb73444e1cd4db0f566da`, Trida Stack 커밋은 `0ddcf516e458a82892d7fe0d0dabeb113d3cf424`입니다. 대시보드의 **Zoro-1 실행 위치** 또는 CLI의 `--model-backend brev|local`로 선택합니다. 기본값은 `ZORO_BACKEND`로 설정합니다.
+
+| 실행 위치 | 기본 주소 | 설정 변수 |
+| --- | --- | --- |
+| Brev GPU | `http://127.0.0.1:30001` | `ZORO_BREV_URL`, `ZORO_BREV_MODEL`, `ZORO_BREV_API_KEY` |
+| 로컬 서버 | `http://127.0.0.1:30002` | `ZORO_LOCAL_URL`, `ZORO_LOCAL_MODEL`, `ZORO_LOCAL_API_KEY` |
+
+Brev 설정에는 기존 `ZORO_URL`, `ZORO_MODEL`, `ZORO_API_KEY`도 사용할 수 있습니다. 로컬 서버는 지원 GPU에서 Trida Stack의 `decide` 모드로 서빙합니다. `python -m zorocart probe --model-backend local`로 `/v1/chat/completions`의 생성과 `/v1/systemone`의 Choice·Score를 확인할 수 있으며, Brev는 `--model-backend brev`를 선택합니다. [Trida Stack 서빙 문서](https://github.com/trillion-labs/trida-stack/blob/0ddcf516e458a82892d7fe0d0dabeb113d3cf424/inference/zoro-1/README.md#decisions)
+
+채점 스크립트는 요청의 필수·제외·선호 조건, 구매 단위와 수량을 현재 판매 옵션의 상품 근거와 비교합니다. 필수 조건은 Choice로 대조하고, 적합도는 0~4 등급의 확률 기댓값으로 계산합니다. 기본 담기 기준은 Score 2.5 이상과 최종 Choice 확률 0.70 이상입니다. `ZOROCART_MIN_SCORE`, `ZOROCART_MIN_PROBABILITY`로 설정합니다.
 
 ## 실행 로그와 검증
 
@@ -41,6 +50,8 @@ python -m pytest -q
 승인된 쿠팡 환경은 [쿠팡 연동 설정](docs/coupang.md)을 따릅니다. 합성 상점 검증과 별개로 승인 범위에서 실제 DOM과 장바구니 요청 형식을 확인해야 합니다. 공식 장바구니 API를 지원하는 대안은 [쇼핑 API 후보](docs/shopping-apis.md)에 정리했습니다.
 
 ## 네이버플러스 스토어
+
+네이버 공개 쇼핑 상품 검색 API는 2026년 7월 31일에 종료됐습니다. NAVER API HUB로 이관된 쇼핑 인사이트는 검색 클릭 추이 데이터입니다. 네이버 고객센터가 안내하는 구매자 장바구니 경로는 네이버 ID 로그인 후 상품 상세에서 담는 방식입니다. [네이버 API 이관 공지](https://developers.naver.com/notice/article/32530) · [장바구니 이용 안내](https://help.pay.naver.com/faq/content.help?faqId=11639)
 
 대시보드에서 **네이버플러스 스토어 · 비로그인**을 선택하면 새 브라우저 세션에서 Zoro-1이 요청을 해석하고 스토어의 검색 화면을 사용합니다. 검색 후 장바구니 접근 여부를 확인합니다. 네이버 로그인 화면이 나타나면 실행을 보류하고 장바구니 초기화와 상품 추가 현황을 표시합니다. [네이버 장바구니 이용 안내](https://help.pay.naver.com/faq/content.help?faqId=11639)
 

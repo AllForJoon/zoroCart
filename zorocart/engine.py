@@ -10,14 +10,7 @@ from typing import Any, Awaitable, Callable
 from .browser import AmbiguousAdd, AmbiguousClear, BrowserAdapter, BrowserError, CartLine, StaleObservation, Target
 from .model import ModelError, ZoroClient
 from .planning import ShoppingItem, ShoppingPlan, generate_search_query, plan_purchase
-
-SCORE_CRITERIA = [
-    '0 — 부적합: 다른 상품 또는 판매 옵션',
-    '1 — 약한 적합: 명시적인 필수 사양 불일치',
-    '2 — 부분 적합: 필수 사양 증거 부족',
-    '3 — 적합: 필수 사양과 수량을 충족',
-    '4 — 정확히 적합: 필수 사양과 수량, 요청한 선호까지 충족',
-]
+from .scoring import FIT_INSTRUCTIONS, SCORE_CRITERIA, candidate_scoring
 
 class Hold(Exception):
     pass
@@ -246,22 +239,15 @@ class ShoppingEngine:
         if reason:
             self.event('candidate_hold', item=item.id, candidate_id=candidate_id, evidence=evidence, reason=reason)
             return None
-        item_requirements = item.model_dump(include={'name', 'required', 'excluded', 'preferred', 'purchase_unit'})
-        option_facts = {key: evidence[key] for key in ('title', 'label', 'attributes', 'delivery', 'pack_count', 'category')}
-        state = {'item': item_requirements, 'option': option_facts, 'order_quantity': quantity,
-                 'verified_facts': '가격·재고·구매 단위·필요 수량 검증을 통과했습니다.'}
-        scores = await self.client.decisions(state, {
-            'requirements': {'type': 'choice', 'instructions': '판매 옵션의 label과 attributes로 상품 종류와 필수·제외 조건을 검사하세요. 상품 제목과 선택 옵션이 충돌하면 선택 옵션이 우선합니다. 필수 조건이 화면에 드러나지 않으면 unverified입니다.',
-                             'criteria': {'match': '상품 종류와 명시적 필수 조건을 모두 만족하고 제외 조건에 해당하지 않음', 'mismatch': '상품 종류 또는 필수·제외 조건 불일치', 'unverified': '화면에서 필수 조건 증거가 부족함'}},
-            'fit': {'type': 'score', 'instructions': '목록의 0~4 등급으로 실제 판매 옵션을 평가하세요. 화면에서 필수 사양이 확인되고 선호 조건이 없거나 충족하면 4, 선호만 불충족하면 3입니다. 가격·재고·구매량은 이미 확인했습니다.', 'criteria': SCORE_CRITERIA},
-        })
+        state, questions = candidate_scoring(item, offer, quantity, purchase.total(plan.include_shipping))
+        scores = await self.client.decisions(state, questions)
         requirements, fit = scores['requirements'], scores['fit']
         if requirements.choice != 'match':
             reason = {'mismatch': '필수 사양 또는 제외 조건 불일치', 'unverified': '필수 조건을 화면에서 확인할 수 없음'}[requirements.choice]
         elif fit.score < self.score_threshold:
             # Recheck low scores once, using fresh detail evidence and reasoned judgment.
             self.event('score_recheck', item=item.id, candidate_id=candidate_id, score=fit.score)
-            fit = await self.client.score(state, '표시 사양과 판매 옵션을 다시 대조해 같은 0~4 기준으로 평가하세요.', SCORE_CRITERIA, reasoning=True)
+            fit = await self.client.score(state, FIT_INSTRUCTIONS, SCORE_CRITERIA, reasoning=True)
             if fit.score < self.score_threshold:
                 reason = f'적합도 {fit.score:.2f}점이 기준에 미달'
         self.event('candidate_score', item=item.id, candidate_id=candidate_id, evidence=evidence,

@@ -12,6 +12,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
 
 from .browser import NAVER_STORE_URL, CoupangApproval
+from .model_backends import ModelBackendName, resolve_model_backend
 from .runner import MCGROCER_URL, Run, SCENARIOS, execute_run
 from .store import get_session, router, with_session
 
@@ -19,6 +20,7 @@ from .store import get_session, router, with_session
 class NewRun(BaseModel):
     request: str = Field(min_length=1, max_length=1800)
     environment: Literal['local', 'coupang', 'naver', 'mcgrocer'] = 'local'
+    model_backend: ModelBackendName | None = None
 
 
 class RunReply(BaseModel):
@@ -28,7 +30,8 @@ class RunReply(BaseModel):
 def create_app(*, store_url: str, log_dir: Path, headless: bool = False,
                coupang_approval: CoupangApproval | None = None,
                coupang_profile_dir: Path | None = None,
-               mcgrocer_state_dir: Path | None = None) -> FastAPI:
+               mcgrocer_state_dir: Path | None = None,
+               default_model_backend: ModelBackendName | None = None) -> FastAPI:
     if (coupang_approval is None) != (coupang_profile_dir is None):
         raise ValueError('쿠팡 모드를 열려면 승인 범위와 전용 브라우저 프로필을 함께 지정하세요.')
     if coupang_approval is not None:
@@ -41,6 +44,7 @@ def create_app(*, store_url: str, log_dir: Path, headless: bool = False,
     runs: dict[str, Run] = {}
     tasks: set[asyncio.Task] = set()
     dashboard_token = token_urlsafe(32)
+    backend_name = resolve_model_backend(default_model_backend).name
     configured_executable = Path(os.getenv('ZOROCART_CHROMIUM_EXECUTABLE', '')).name
     browser_name = ('Google Chrome' if configured_executable == 'Google Chrome'
                     or os.getenv('ZOROCART_CHROMIUM_CHANNEL') == 'chrome' else 'Chromium')
@@ -65,7 +69,8 @@ def create_app(*, store_url: str, log_dir: Path, headless: bool = False,
     async def dashboard(request: Request):
         cart_session, _ = get_session(request)
         html = Path(__file__).with_name('dashboard.html').read_text(encoding='utf-8')
-        rendered = html.replace('__DASHBOARD_TOKEN__', dashboard_token).replace('__BROWSER_NAME__', browser_name)
+        rendered = (html.replace('__DASHBOARD_TOKEN__', dashboard_token).replace('__BROWSER_NAME__', browser_name)
+                    .replace('__MODEL_BACKEND__', backend_name))
         response = HTMLResponse(rendered, headers={
             'Cache-Control': 'no-store', 'X-Frame-Options': 'DENY', 'Referrer-Policy': 'no-referrer',
         })
@@ -97,7 +102,7 @@ def create_app(*, store_url: str, log_dir: Path, headless: bool = False,
         if len(runs) >= 40:
             del runs[next(iter(runs))]
         cart_session = get_session(request)[0] if data.environment == 'local' else None
-        run = Run(data.request.strip(), environment=data.environment)
+        run = Run(data.request.strip(), environment=data.environment, model_backend=data.model_backend or backend_name)
         runs[run.id] = run
 
         async def work():

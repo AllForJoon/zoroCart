@@ -85,3 +85,26 @@ def test_dashboard_starts_guest_runs_with_dedicated_profile_and_separate_demo_se
             'headless': False, 'interactive': True, 'mcgrocer_state_dir': mcgrocer_state,
         })
         assert calls == [live, naver, mcgrocer, local, live]
+
+
+def test_dashboard_records_chosen_model_backend(tmp_path, monkeypatch):
+    calls = []
+
+    async def capture_run(run, store_url, **settings):
+        calls.append(run.model_backend)
+        run.result = {'status': 'complete', 'added': [], 'remaining': []}
+
+    monkeypatch.setenv('ZORO_BACKEND', 'local')
+    monkeypatch.setattr(dashboard_app, 'execute_run', capture_run)
+    app = dashboard_app.create_app(store_url=STORE_URL, log_dir=tmp_path)
+    with TestClient(app) as client:
+        assert 'name="zc-model-backend" content="local"' in client.get('/').text
+        headers = dashboard_headers(client)
+        request = {'request': '무향 물티슈 한 팩 담아줘.'}
+        assert client.post('/api/runs', headers=headers, json={**request, 'model_backend': 'unknown'}).status_code == 422
+        for data, expected in ((request, 'local'), ({**request, 'model_backend': 'brev'}, 'brev')):
+            response = client.post('/api/runs', headers=headers, json=data)
+            assert response.status_code == 202
+            artifact = client.get('/api/runs/' + response.json()['id'], headers=headers).json()
+            assert artifact['model_backend'] == expected
+    assert calls == ['local', 'brev']

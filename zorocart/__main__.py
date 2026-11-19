@@ -3,7 +3,6 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
-import os
 from pathlib import Path
 from statistics import mean
 from urllib.parse import urlencode
@@ -12,14 +11,15 @@ import uvicorn
 
 from .app import create_app
 from .browser import CoupangApproval
-from .model import ZoroClient
-from .runner import CHECKPOINT, Run, SCENARIOS, execute_run
+from .model import ModelError
+from .model_backends import MODEL_BACKENDS, probe_model_backend, resolve_model_backend
+from .runner import Run, SCENARIOS, execute_run
 
 
 def options() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description='ZoroCart 장바구니 에이전트')
     commands = parser.add_subparsers(dest='command', required=True)
-    commands.add_parser('probe', help='Brev의 생성·판단 API 확인')
+    probe = commands.add_parser('probe', help='Zoro-1 생성·판단 API 확인')
     serve = commands.add_parser('serve', help='로컬 상점과 한국어 대시보드 실행')
     serve.add_argument('--port', type=int, default=8765)
     serve.add_argument('--headless', action='store_true')
@@ -38,13 +38,15 @@ def options() -> argparse.Namespace:
     run.add_argument('--timeout', type=int, default=420)
     run.add_argument('--store-url', default='http://127.0.0.1:8765/store')
     run.add_argument('--output', type=Path)
-    validate = commands.add_parser('validate', help='세 시나리오를 실제 Brev 모델로 연속 검증')
+    validate = commands.add_parser('validate', help='세 시나리오를 선택한 Zoro-1 모델로 연속 검증')
     validate.add_argument('--scenario', choices=list(SCENARIOS))
     validate.add_argument('--runs', type=int, default=5)
     validate.add_argument('--store-url', default='http://127.0.0.1:8765/store')
     validate.add_argument('--timeout', type=int, default=420)
     validate.add_argument('--headed', action='store_true')
     validate.add_argument('--output', type=Path, default=Path('logs/validation'))
+    for command_parser in (probe, serve, run, validate):
+        command_parser.add_argument('--model-backend', choices=MODEL_BACKENDS, help='Zoro-1 실행 위치')
     return parser.parse_args()
 
 
@@ -114,10 +116,13 @@ def check_result(scenario: str, artifact: dict) -> tuple[bool, bool | None]:
 
 async def command(args: argparse.Namespace) -> int:
     if args.command == 'probe':
-        async with ZoroClient(os.environ.get('ZORO_URL', 'http://127.0.0.1:30001'),
-                              model=os.environ.get('ZORO_MODEL', CHECKPOINT),
-                              api_key=os.environ.get('ZORO_API_KEY'), timeout=90) as client:
-            print(json.dumps(await client.probe(), ensure_ascii=False, indent=2))
+        backend = resolve_model_backend(args.model_backend)
+        try:
+            result = await probe_model_backend(backend, timeout=90)
+        except ModelError as error:
+            print(json.dumps({**backend.summary(), 'status': 'error', 'reason': str(error)}, ensure_ascii=False))
+            return 1
+        print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0
     if args.command == 'run':
         approval = CoupangApproval.from_file(args.coupang_approval) if args.coupang_approval else None
@@ -126,7 +131,8 @@ async def command(args: argparse.Namespace) -> int:
         url = approval.home_url if approval else args.store_url
         if args.fault:
             url = f'{url}?{urlencode({"fault": args.fault})}'
-        run = Run(args.request if args.request else SCENARIOS[args.scenario], 'coupang' if approval else 'local')
+        run = Run(args.request if args.request else SCENARIOS[args.scenario], 'coupang' if approval else 'local',
+                  model_backend=args.model_backend)
         result = await execute_run(run, url, headless=args.headless, timeout=args.timeout, approval=approval,
                                    profile_dir=args.profile_dir if approval else None)
         run.save(args.output or Path('logs') / f'{run.id}.json')
@@ -138,7 +144,7 @@ async def command(args: argparse.Namespace) -> int:
     for scenario in [args.scenario] if args.scenario else SCENARIOS:
         runs = []
         for number in range(1, args.runs + 1):
-            run = Run(SCENARIOS[scenario])
+            run = Run(SCENARIOS[scenario], model_backend=args.model_backend)
             await execute_run(run, args.store_url, timeout=args.timeout, headless=not args.headed)
             artifact = run.artifact()
             passed, expected_changes = check_result(scenario, artifact)
@@ -166,7 +172,8 @@ def main():
         uvicorn.run(create_app(store_url=f'http://127.0.0.1:{args.port}/store', log_dir=args.log_dir,
                                headless=args.headless, coupang_approval=approval,
                                coupang_profile_dir=args.profile_dir,
-                               mcgrocer_state_dir=args.mcgrocer_state_dir),
+                               mcgrocer_state_dir=args.mcgrocer_state_dir,
+                               default_model_backend=args.model_backend),
                     host='127.0.0.1', port=args.port, access_log=False)
     else:
         raise SystemExit(asyncio.run(command(args)))

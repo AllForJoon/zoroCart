@@ -15,12 +15,11 @@ from playwright.async_api import async_playwright
 
 from .browser import BrowserAdapter, CoupangApproval
 from .engine import ShoppingEngine
-from .model import ZoroClient
+from .model_backends import ModelBackendName, resolve_model_backend
 from .shopify_live import MCGROCER_URL, ShopifyStore
 from .shopify_session import restore_cart, save_cart
 from .store import COOKIE as DEMO_CART_COOKIE
 
-CHECKPOINT = 'bf1b76b9b4df03b05fcbb73444e1cd4db0f566da'
 SERVING_COMMIT = '0ddcf516e458a82892d7fe0d0dabeb113d3cf424'
 
 SCENARIOS = {
@@ -53,6 +52,7 @@ def sanitized(value):
 class Run:
     request: str
     environment: str = 'local'
+    model_backend: ModelBackendName | None = field(default=None, kw_only=True)
     id: str = field(default_factory=lambda: uuid4().hex)
     events: list[dict] = field(default_factory=list)
     result: dict | None = None
@@ -80,7 +80,8 @@ class Run:
 
     def artifact(self) -> dict:
         calls = [e for e in self.events if e['kind'] == 'model_call']
-        return {'run_id': self.id, 'environment': self.environment, 'timestamp': self.timestamp,
+        return {'run_id': self.id, 'environment': self.environment, 'model_backend': self.model_backend,
+                'timestamp': self.timestamp,
                 'request': sanitized(self.request), 'pending': self.pending, 'result': self.result,
                 'metrics': {'elapsed_ms': (self.events[-1]['elapsed_ms'] if self.result and self.events else
                                             round((time.monotonic() - self.started) * 1000)),
@@ -122,6 +123,8 @@ async def execute_run(run: Run, store_url: str, *, headless=False, interactive=F
     native_read_only = bool(approval and approval.native_read_only)
     deadline = time.monotonic() + timeout
     try:
+        backend = resolve_model_backend(run.model_backend)
+        run.model_backend = backend.name
         async with asyncio.timeout(timeout), async_playwright() as pw:
             options = {'headless': headless}
             if channel := os.environ.get('ZOROCART_CHROMIUM_CHANNEL'):
@@ -161,11 +164,8 @@ async def execute_run(run: Run, store_url: str, *, headless=False, interactive=F
                 await browser_context.add_cookies([{'name': DEMO_CART_COOKIE, 'value': demo_cart_session,
                                                    'url': f'{origin.scheme}://{origin.netloc}/',
                                                    'httpOnly': True, 'sameSite': 'Strict'}])
-            async with ZoroClient(os.environ.get('ZORO_URL', 'http://127.0.0.1:30001'),
-                                  model=os.environ.get('ZORO_MODEL', CHECKPOINT),
-                                  api_key=os.environ.get('ZORO_API_KEY'), event=run.event,
-                                  timeout=min(150, timeout)) as client:
-                run.event('run_started', checkpoint=os.environ.get('ZORO_MODEL', CHECKPOINT),
+            async with backend.client(event=run.event, timeout=min(150, timeout)) as client:
+                run.event('run_started', model_backend=backend.name, checkpoint=backend.model,
                           reference_serving_commit=SERVING_COMMIT, visible_browser=not headless)
                 engine_options = {'confirm': run.ask if interactive else None,
                                   'score_threshold': float(os.environ.get('ZOROCART_MIN_SCORE', '2.5')),
