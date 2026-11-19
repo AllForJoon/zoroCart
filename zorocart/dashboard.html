@@ -4,40 +4,72 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="zc-token" content="__DASHBOARD_TOKEN__">
+<meta name="zc-browser" content="__BROWSER_NAME__">
 <title>ZoroCart</title>
 <style>
 :root{color-scheme:light;--bg:#f2f4ef;--ink:#202a24;--muted:#58645d;--line:#dce3db;--green:#1f5a3c;--paper:#fff;--light:#e6f0e8}*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font-family:system-ui,-apple-system,sans-serif;line-height:1.5}main{max-width:1100px;margin:auto;padding:28px 24px 60px}header{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:32px;border-bottom:1px solid var(--line);padding:8px 0 18px}.brand{font-size:22px;letter-spacing:-.05em;font-weight:800}.demo{color:var(--green);background:var(--light);font-size:13px;padding:5px 10px;border-radius:7px}h1{letter-spacing:-.06em;font-size:clamp(34px,6vw,57px);line-height:1.12;margin:5px 0 20px}h2{font-size:18px;margin:0 0 12px}.layout{display:grid;grid-template-columns:minmax(0,1.12fr) minmax(0,1fr);gap:16px}.panel{background:var(--paper);border:1px solid var(--line);border-radius:14px;padding:20px;min-width:0}.full{grid-column:1/-1}.fields{display:grid;gap:12px}textarea,input{font:inherit;border:1px solid #aab7ac;border-radius:9px;padding:11px 13px;width:100%;color:var(--ink);background:#fbfdfa}textarea{resize:vertical;min-height:142px}button{font:inherit;border:1px solid var(--line);border-radius:8px;padding:8px 12px;cursor:pointer;font-weight:650;color:var(--ink);background:#fafcf9}button:hover{background:var(--light)}button:disabled{opacity:.6;cursor:default}.primary{color:white;background:var(--green);border-color:var(--green);padding:10px 16px;justify-self:start}.primary:hover{background:#18482f}.buttons{display:flex;flex-wrap:wrap;gap:7px}.subtle,.empty,small{color:var(--muted)}.status{display:inline-flex;align-items:center;min-height:29px;font-weight:700;color:var(--green)}.events{max-height:245px;overflow:auto;list-style:none;margin:7px 0 0;padding:0}.events li,.rows li{border-bottom:1px solid var(--line);padding:8px 0;overflow-wrap:anywhere}.events li:last-child,.rows li:last-child{border-bottom:none}.rows{list-style:none;padding:0;margin:0}.money{font-size:26px;font-weight:800;letter-spacing:-.04em}.notice{margin-top:10px;background:#f9f4e8;color:#634612;border-radius:8px;padding:10px 13px}.candidate-table{width:100%;border-collapse:collapse;font-size:14px}.candidate-table th,.candidate-table td{padding:9px;text-align:left;border-bottom:1px solid var(--line);overflow-wrap:anywhere}.candidate-table th:nth-child(2),.candidate-table td:nth-child(2){min-width:62px}.table-wrap{overflow-x:auto}[hidden]{display:none!important}@media(max-width:730px){.layout{grid-template-columns:1fr}main{padding:15px 15px 36px}header{margin-bottom:23px}.panel{padding:15px}}
 </style>
+<style>
+.mode-field{display:grid;gap:6px;max-width:320px}
+.mode-field select{font:inherit;color:var(--ink);background:#fbfdfa;border:1px solid #aab7ac;
+  border-radius:9px;padding:9px 11px;width:100%}
+.demo[data-mode="coupang"]{background:#f9f0df;color:#68430f}
+</style>
 </head>
 <body><main>
-<header><div class="brand">ZoroCart</div><div class="demo">로컬 시연 · 합성 상품 · 실제 Zoro-1</div></header>
+<header><div class="brand">ZoroCart</div><div class="demo" id="environment-badge">로컬 시연 · 합성 상품 · 실제 Zoro-1</div></header>
 <h1>무엇을 장바구니에 담을까요?</h1>
 <div class="layout">
 <section class="panel"><h2>쇼핑 요청</h2>
-<form id="request-form" class="fields"><label for="request" class="subtle">필요한 품목, 수량, 예산이나 준비할 상황을 입력하세요.</label>
+<form id="request-form" class="fields">
+<label class="mode-field" for="environment">실행 환경
+<select id="environment" aria-describedby="environment-note">
+<option value="local" selected>로컬 시연</option>
+<option value="coupang" disabled>쿠팡 실사이트 · 비로그인</option>
+</select></label>
+<small id="environment-note" hidden>쿠팡 실사이트는 승인 범위와 전용 Chromium 프로필을 설정하면 열립니다.</small>
+<label for="request" class="subtle">필요한 품목, 수량, 예산이나 준비할 상황을 입력하세요.</label>
 <textarea id="request" maxlength="1800" aria-describedby="reset-policy" required></textarea>
-<div id="scenarios" class="buttons" aria-label="시연 요청"></div>
+<div id="scenarios" class="buttons" aria-label="요청 예시"></div>
 <small id="reset-policy">요청이 확정되면 기존 시연 장바구니를 비운 뒤 새 상품을 찾아 담습니다.</small>
 <button class="primary" id="run-button">장바구니 비우고 시작</button></form>
 <div id="confirm" class="notice" hidden><p id="confirm-message"></p><form id="reply-form" class="fields" hidden><input id="reply" aria-label="확인 답변" maxlength="750" required><button type="submit">답변 보내기</button></form><div id="partial-buttons" class="buttons" hidden><button data-answer="yes">이 품목 담기</button><button data-answer="no">취소</button></div></div>
 </section>
-<section class="panel"><h2>진행 상태</h2><div class="status" id="status" role="status">대기 중</div><div id="reset-status" class="subtle" aria-live="polite" hidden></div><div id="metrics" class="subtle"></div><ol class="events" id="events" aria-label="최근 진행"></ol></section>
-<section class="panel"><h2>이번 실행에서 확인한 장바구니</h2><div id="result" class="empty">실행이 끝나면 추가된 상품과 수량이 표시됩니다.</div><p><a href="/store/cart" target="_blank" rel="noopener" style="color:var(--green)">시연 장바구니 보기</a></p></section>
+<section class="panel"><h2>진행 상태</h2><div class="status" id="status" role="status">대기 중</div><div id="run-environment" class="subtle" hidden></div><div id="reset-status" class="subtle" aria-live="polite" hidden></div><div id="metrics" class="subtle"></div><ol class="events" id="events" aria-label="최근 진행"></ol></section>
+<section class="panel"><h2>이번 실행에서 확인한 장바구니</h2><div id="result" class="empty">실행이 끝나면 추가된 상품과 수량이 표시됩니다.</div><p id="demo-cart-link"><a href="/store/cart" target="_blank" rel="noopener" style="color:var(--green)">시연 장바구니 보기</a></p></section>
 <section class="panel"><h2>후보 점수</h2><div class="table-wrap"><table class="candidate-table"><thead><tr><th scope="col">상품과 옵션</th><th scope="col">점수</th><th scope="col">판단</th></tr></thead><tbody id="candidates"></tbody></table><p id="no-candidates" class="empty">상세 화면에서 확인한 후보가 여기에 표시됩니다.</p></div></section>
 </div></main>
 <script>
 'use strict';
 const $=id=>document.getElementById(id);
 const token=document.querySelector('meta[name=zc-token]').content;
+const browserName=document.querySelector('meta[name=zc-browser]').content;
 let runId=null;
+let coupangAvailable=false;
+let coupangWritesAvailable=false;
 const statusNames={complete:'장바구니 검증 완료',partial:'일부 품목 검증 완료',held:'담기 보류',error:'실행 오류'};
 const titles={shopping_plan:'구매 계획 확정',cart_reset_started:'기존 장바구니 확인',cart_reset_verified:'빈 장바구니 확인',cart_reset_incomplete:'장바구니 초기화 보류',search_query:'검색어 생성',browser_action:'브라우저',cart_baseline:'담기 전 빈 장바구니 확인',cart_verification:'장바구니 수량 대조',add_uncertain:'담기 응답 확인 중',stale_observation:'화면 변경 후 재관찰',choice_recheck:'상품 근거 재확인',held:'담기 보류'};
 const add=(parent,tag,content,className)=>{const node=document.createElement(tag);node.textContent=content;if(className)node.className=className;parent.append(node);return node;};
 const won=n=>new Intl.NumberFormat('ko-KR').format(n)+'원';
 async function api(path, method='GET', body){const options={method,headers:{'X-ZoroCart-Token':token}};if(body){options.headers['Content-Type']='application/json';options.body=JSON.stringify(body);}const response=await fetch(path,options);if(!response.ok){const error=await response.json();throw new Error(typeof error.detail==='string'?error.detail:'요청에 실패했습니다.');}return response.json();}
+function showEnvironment(){
+ const live=$('environment').value==='coupang';
+ $('environment-badge').dataset.mode=live?'coupang':'local';
+ $('environment-badge').textContent=live?'쿠팡 실사이트 · 비로그인':'로컬 시연 · 합성 상품 · 실제 Zoro-1';
+ $('environment-note').hidden=coupangAvailable&&(!live||coupangWritesAvailable);
+ $('environment-note').textContent=coupangAvailable?'비로그인 장바구니의 삭제·담기 경로 확인이 필요합니다.':'쿠팡 실사이트는 승인 범위와 전용 Chromium 프로필을 설정하면 열립니다.';
+ $('reset-policy').textContent=live?(coupangWritesAvailable?`${browserName}의 비로그인 장바구니를 비운 뒤 새 상품을 찾아 담습니다.`:`${browserName}에서 비로그인 접속을 확인합니다.`):'요청이 확정되면 기존 시연 장바구니를 비운 뒤 새 상품을 찾아 담습니다.';
+ $('run-button').textContent=live?(coupangWritesAvailable?'쿠팡 장바구니 비우고 시작':'쿠팡 비로그인 접속 확인'):'장바구니 비우고 시작';
+ $('demo-cart-link').hidden=live;
+}
+function running(value){
+ $('run-button').disabled=value;$('environment').disabled=value;
+}
 function render(data){
- const {result,events,metrics,pending}=data;
+ const {result,events,metrics,pending,environment}=data;
  $('status').textContent=result?statusNames[result.status]:pending?'사용자 확인 대기 중':'실행 중';
+ $('run-environment').hidden=false;
+ $('run-environment').textContent=environment==='coupang'?'쿠팡 실사이트 · 비로그인':'로컬 시연 실행';
  const reset=events.find(e=>e.kind==='cart_reset_verified');
  const resetStarted=events.find(e=>e.kind==='cart_reset_started');
  $('reset-status').hidden=!resetStarted;
@@ -58,12 +90,14 @@ function render(data){
  for(const line of result.added){const row=add(rows,'li','');add(row,'strong',line.title);add(row,'div',`${line.option} · 주문 ${line.quantity}개 · 단위당 구성 ${line.pack_count} · ${won(line.merchandise_total)}${line.delivery?' · '+line.delivery:''}`,'subtle');if(line.verified_attributes?.length)add(row,'small',line.verified_attributes.join(' · '));}
  if(result.reason)add(display,'p',result.reason,'notice');
  if(result.remaining.length){const list=add(display,'ul','','rows');for(const item of result.remaining)add(list,'li',`${item.item} · ${item.reason}`);}
- $('run-button').disabled=false;
+ running(false);
 }
-async function poll(){try{const data=await api('/api/runs/'+runId);render(data);if(!data.result)setTimeout(poll,800);}catch(error){$('status').textContent=error.message;$('run-button').disabled=false;}}
-$('request-form').addEventListener('submit',async event=>{event.preventDefault();$('run-button').disabled=true;$('status').textContent='실행 준비 중';try{const response=await api('/api/runs','POST',{request:$('request').value});runId=response.id;$('reset-status').hidden=true;$('reset-status').textContent='';$('result').textContent='장바구니를 확인할 때까지 기다려 주세요.';poll();}catch(error){$('status').textContent=error.message;$('run-button').disabled=false;}});
+async function poll(){try{const data=await api('/api/runs/'+runId);render(data);if(!data.result)setTimeout(poll,800);}catch(error){$('status').textContent=error.message;running(false);}}
+$('request-form').addEventListener('submit',async event=>{event.preventDefault();const environment=$('environment').value;running(true);$('status').textContent='실행 준비 중';try{const response=await api('/api/runs','POST',{request:$('request').value,environment});runId=response.id;$('reset-status').hidden=true;$('reset-status').textContent='';$('result').textContent='장바구니를 확인할 때까지 기다려 주세요.';poll();}catch(error){$('status').textContent=error.message;running(false);}});
 async function reply(answer){try{await api('/api/runs/'+runId+'/reply','POST',{answer});$('confirm').hidden=true;$('reply').value='';}catch(error){$('confirm-message').textContent=error.message;}}
 $('reply-form').addEventListener('submit',event=>{event.preventDefault();reply($('reply').value);});
 $('partial-buttons').addEventListener('click',event=>{if(event.target.dataset.answer)reply(event.target.dataset.answer);});
+$('environment').addEventListener('change',showEnvironment);
+api('/api/environments').then(({coupang_available,coupang_writes_available})=>{coupangAvailable=coupang_available;coupangWritesAvailable=coupang_writes_available;$('environment').querySelector('option[value=coupang]').disabled=!coupang_available;showEnvironment();}).catch(error=>{$('status').textContent=error.message;});
 api('/api/scenarios').then(data=>{for(const [key,name] of Object.entries({household:'생활용품',pasta:'토마토 파스타',camping:'캠핑'})){const button=add($('scenarios'),'button',name);button.type='button';button.addEventListener('click',()=>{$('request').value=data[key];$('request').focus();});}}).catch(error=>{$('status').textContent=error.message;});
 </script></body></html>

@@ -8,13 +8,87 @@ import uvicorn
 from fastapi import FastAPI
 from playwright.async_api import Error as PlaywrightError, async_playwright
 
-from zorocart.browser import BrowserAdapter, BrowserBlocked, StaleObservation
+from zorocart.browser import LOCAL_DOM, BrowserAdapter, BrowserBlocked, CoupangApproval, StaleObservation
+from zorocart.coupang_live import CoupangDesktopAdapter
 from zorocart.store import router
 
 
 def test_live_approval_is_required_before_navigation():
     with pytest.raises(BrowserBlocked):
         BrowserAdapter(None, "https://www.coupang.com", mode="coupang")
+
+
+def test_live_cart_has_separate_origin_and_path_scope():
+    home = "https://www.coupang.com"
+    cart = "https://cart.coupang.com"
+    approval = CoupangApproval(
+        reference="synthetic-scoping-test",
+        home_url=home,
+        cart_url=cart + "/fixture/cart",
+        read_paths=("/", "/fixture/products"),
+        add_path="/fixture/add",
+        dom=LOCAL_DOM,
+        add_fields={"product": "productId", "option": "optionId", "quantity": "count"},
+        clear_path="/fixture/clear",
+        clear_items_field="items",
+        add_origin=cart,
+    )
+    adapter = BrowserAdapter(None, home, mode="coupang", approval=approval)
+    assert adapter._in_scope(cart + "/fixture/cart")
+    assert adapter._in_scope(home + "/fixture/products")
+    assert not adapter._in_scope(cart + "/fixture/products")
+    assert not adapter._in_scope(home + "/fixture/cart")
+    assert not adapter._in_scope("https://shop.example/fixture/cart")
+    assert adapter._is_write_url(cart + "/fixture/add", "/fixture/add")
+    assert adapter._is_write_url(cart + "/fixture/clear", "/fixture/clear")
+    assert not adapter._is_write_url(home + "/fixture/clear", "/fixture/clear")
+    headers = {"origin": home, "access-control-request-method": "POST"}
+    assert not adapter._allowed_preflight(cart + "/fixture/add", headers)
+    adapter._pending_path = "/fixture/add"
+    assert adapter._allowed_preflight(cart + "/fixture/add", headers)
+    assert not adapter._allowed_preflight(cart + "/fixture/clear", headers)
+
+
+def test_confirmed_desktop_reads_when_no_write_contract_is_configured():
+    home = "https://www.coupang.com"
+    cart = "https://cart.coupang.com"
+    settings = dict(
+        reference="synthetic-read-only-test",
+        home_url=home,
+        cart_url=cart + "/fixture/cart",
+        read_paths=("/", "/fixture/search"),
+    )
+    with pytest.raises(ValueError):
+        CoupangApproval(**settings).validate()
+    approval = CoupangApproval(**settings, desktop_ui=True)
+    adapter = BrowserAdapter(None, home, mode="coupang", approval=approval)
+    assert adapter._in_scope(cart + "/fixture/cart")
+    assert not any((adapter.can_write, adapter.can_add, adapter.can_clear))
+    assert not any((approval.can_write, approval.can_add, approval.can_clear))
+
+
+def test_desktop_guest_cart_recognizes_legacy_empty_page():
+    async def exercise():
+        approval = CoupangApproval(
+            reference="fixture", home_url="https://www.coupang.com/", read_paths=("/",),
+            cart_url="https://cart.coupang.com/cartView.pang", desktop_ui=True,
+        )
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(channel=os.getenv("ZOROCART_CHROMIUM_CHANNEL"))
+            page = await browser.new_page()
+
+            async def serve(route):
+                await route.fulfill(content_type="text/html; charset=utf-8", body="""<!doctype html>
+                <html lang="ko"><title>장바구니</title><h1>장바구니(0)</h1>
+                <p>장바구니에 담은 상품이 없습니다.</p></html>""")
+
+            await page.route(approval.cart_url, serve)
+            await page.goto(approval.cart_url)
+            adapter = CoupangDesktopAdapter(page, approval.home_url, mode="coupang", approval=approval)
+            assert await adapter.read_cart() == ()
+            await browser.close()
+
+    asyncio.run(exercise())
 
 
 def test_transient_read_navigation_retries_once():
@@ -146,3 +220,12 @@ async def assert_browser_guards(adapter, page):
 
     with pytest.raises(BrowserBlocked):
         await adapter.open_product(adapter.home_url + "/checkout")
+
+    blocked_context = await page.context.browser.new_context(service_workers="block")
+    try:
+        blocked_page = await blocked_context.new_page()
+        blocked_adapter = BrowserAdapter(blocked_page, adapter.home_url + "?fault=blocked")
+        with pytest.raises(BrowserBlocked, match="HTTP 403"):
+            await blocked_adapter.open_home()
+    finally:
+        await blocked_context.close()

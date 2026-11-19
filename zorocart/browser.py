@@ -12,6 +12,8 @@ from urllib.parse import parse_qsl, urljoin, urlsplit
 
 from playwright.async_api import ElementHandle, Error as PlaywrightError, Page, Route
 
+from .coupang_evidence import parse_pack, parse_price, parse_quantity
+
 CONTROL_ACTIONS = {
     "search-input": "TYPE_TEXT",
     "search-submit": "CLICK",
@@ -40,6 +42,11 @@ FORBIDDEN_PATH = re.compile(
 )
 SAFE_KEY = re.compile(r"[A-Za-z0-9_.:-]{1,120}\Z")
 COUNT = r"(?:[0-9]{1,3}(?:,[0-9]{3})+|[0-9]+)"
+_ACCESS_REASON = {
+    401: "상점에서 로그인이 필요하다고 응답했습니다",
+    403: "상점에서 브라우저 접근 제한을 반환했습니다",
+    429: "상점의 요청 횟수 제한에 도달했습니다",
+}
 
 
 class BrowserError(RuntimeError):
@@ -138,12 +145,16 @@ class CoupangApproval:
     home_url: str
     cart_url: str
     read_paths: tuple[str, ...]
-    add_path: str
-    dom: dict[str, object] = field(repr=False)
-    add_fields: dict[str, str] = field(repr=False)
+    add_path: str | None = None
+    dom: dict[str, object] = field(default_factory=dict, repr=False)
+    add_fields: dict[str, str] | None = field(default=None, repr=False)
     asset_hosts: tuple[str, ...] = ()
     clear_path: str | None = None
     clear_items_field: str | None = None
+    cart_read_paths: tuple[str, ...] = ()
+    add_origin: str | None = None
+    clear_origin: str | None = None
+    desktop_ui: bool = False
 
     @classmethod
     def from_file(cls, path: str | Path) -> CoupangApproval:
@@ -156,12 +167,16 @@ class CoupangApproval:
                 home_url=data["home_url"],
                 cart_url=data["cart_url"],
                 read_paths=tuple(data["read_paths"]),
-                add_path=data["add_path"],
-                dom=data["dom"],
-                add_fields=data["add_fields"],
+                add_path=data.get("add_path"),
+                dom=data.get("dom", {}),
+                add_fields=data.get("add_fields"),
                 asset_hosts=tuple(data.get("asset_hosts", ())),
                 clear_path=data.get("clear_path"),
                 clear_items_field=data.get("clear_items_field"),
+                cart_read_paths=tuple(data.get("cart_read_paths", ())),
+                add_origin=data.get("add_origin"),
+                clear_origin=data.get("clear_origin"),
+                desktop_ui=data.get("desktop_ui", False),
             )
             approval.validate()
         except (OSError, ValueError, KeyError, TypeError, re.error) as exc:
@@ -172,50 +187,88 @@ class CoupangApproval:
         if (
             not isinstance(self.reference, str)
             or not self.reference.strip()
+            or type(self.desktop_ui) is not bool
             or not self.read_paths
-            or any(not path.startswith("/") or len(path) > 250 for path in self.read_paths)
-            or not re.fullmatch(r"/[A-Za-z0-9/_\-.]+", self.add_path)
-            or BLOCKED_PATH.search(self.add_path)
-            or FORBIDDEN_PATH.search(self.add_path)
+            or any(
+                not isinstance(path, str) or not path.startswith("/") or len(path) > 250
+                for path in (*self.read_paths, *self.cart_read_paths)
+            )
         ):
             raise ValueError("Invalid approved paths or reference")
+        if not self.desktop_ui or self.add_path is not None or self.add_fields is not None:
+            if (
+                not isinstance(self.add_path, str)
+                or not re.fullmatch(r"/[A-Za-z0-9/_\-.]+", self.add_path)
+                or BLOCKED_PATH.search(self.add_path)
+                or FORBIDDEN_PATH.search(self.add_path)
+                or not isinstance(self.add_fields, dict)
+                or set(self.add_fields) != {"product", "option", "quantity"}
+                or any(
+                    not isinstance(name, str) or not name.strip() for name in self.add_fields.values()
+                )
+                or len(set(self.add_fields.values())) != 3
+            ):
+                raise ValueError("Incomplete approved add settings")
+        if not isinstance(self.home_url, str) or not isinstance(self.cart_url, str):
+            raise ValueError("Approved navigation URLs must be strings")
         home, cart = urlsplit(self.home_url), urlsplit(self.cart_url)
+        read_scopes = self.read_scopes()
         if (
             home.scheme != "https"
+            or cart.scheme != "https"
             or home.hostname not in {"www.coupang.com", "m.coupang.com", "coupang.com"}
-            or _origin(home) != _origin(cart)
-            or home.port not in (None, 443)
-            or any(part.username or part.password or part.fragment for part in (home, cart))
+            or cart.hostname not in {home.hostname, "cart.coupang.com"}
             or any(
-                not any(re.fullmatch(rule, part.path or "/") for rule in self.read_paths)
+                part.port not in (None, 443)
+                or part.username is not None
+                or part.password is not None
+                or part.fragment
+                for part in (home, cart)
+            )
+            or any(
+                not any(re.fullmatch(rule, part.path or "/") for rule in read_scopes[_origin(part)])
                 or BLOCKED_PATH.search(part.path)
                 or FORBIDDEN_PATH.search(part.path)
                 for part in (home, cart)
             )
         ):
             raise ValueError("Invalid approved Coupang origin or navigation")
+        for setting in (self.add_origin, self.clear_origin):
+            if setting is None:
+                continue
+            if not isinstance(setting, str):
+                raise ValueError("Approved mutation origin must be a string")
+            parsed = urlsplit(setting)
+            if (
+                _origin(parsed) not in {_origin(home), _origin(cart)}
+                or parsed.path not in {"", "/"}
+                or parsed.query
+                or parsed.fragment
+                or parsed.username is not None
+                or parsed.password is not None
+            ):
+                raise ValueError("Invalid approved cart mutation origin")
         if not isinstance(self.dom, dict):
             raise ValueError("Missing approved DOM settings")
-        if (
-            not isinstance(self.add_fields, dict)
-            or set(self.add_fields) != {"product", "option", "quantity"}
-            or any(
-                not isinstance(name, str) or not name.strip() for name in self.add_fields.values()
-            )
-            or len(set(self.add_fields.values())) != 3
-        ):
-            raise ValueError("Incomplete approved add fields")
-        for member, keys in (
-            ("views", ("home", "results", "detail", "cart")),
-            ("controls", tuple(role for role in CONTROL_ACTIONS if role != "clear-cart")),
-            ("fields", tuple(key for key in FIELDS if key != "capacity")),
-        ):
-            group = self.dom.get(member)
-            if not isinstance(group, dict) or any(
-                not isinstance(group.get(key), str) or not group[key].strip() for key in keys
+        if not self.desktop_ui or self.dom:
+            for member, keys in (
+                ("views", ("home", "results", "detail", "cart")),
+                ("controls", tuple(role for role in CONTROL_ACTIONS if role != "clear-cart")),
+                ("fields", tuple(key for key in FIELDS if key != "capacity")),
             ):
-                raise ValueError("Incomplete approved DOM settings")
-        clear_selector = self.dom["controls"].get("clear-cart")
+                group = self.dom.get(member)
+                if not isinstance(group, dict) or any(
+                    not isinstance(group.get(key), str) or not group[key].strip() for key in keys
+                ):
+                    raise ValueError("Incomplete approved DOM settings")
+            for key in (
+                "product", "variant", "cart_row", "empty", "selected",
+                "key_attr", "option_attr",
+            ):
+                value = self.dom.get(key)
+                if not isinstance(value, str) or not value.strip():
+                    raise ValueError("Incomplete approved DOM settings")
+        clear_selector = self.dom.get("controls", {}).get("clear-cart")
         if self.clear_path is not None or self.clear_items_field is not None or clear_selector is not None:
             if (
                 not isinstance(self.clear_path, str)
@@ -225,8 +278,9 @@ class CoupangApproval:
                 or FORBIDDEN_PATH.search(self.clear_path)
                 or not isinstance(self.clear_items_field, str)
                 or not self.clear_items_field.strip()
-                or not isinstance(clear_selector, str)
-                or not clear_selector.strip()
+                or (not self.desktop_ui and (
+                    not isinstance(clear_selector, str) or not clear_selector.strip()
+                ))
             ):
                 raise ValueError("Incomplete approved cart-clear settings")
             row_attr = self.dom.get("clear_row_id_attr")
@@ -234,15 +288,29 @@ class CoupangApproval:
                 not isinstance(row_attr, str) or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]*", row_attr)
             ):
                 raise ValueError("Invalid approved cart row identifier attribute")
-        for key in (
-            "product", "variant", "cart_row", "empty", "selected",
-            "key_attr", "option_attr",
-        ):
-            value = self.dom.get(key)
-            if not isinstance(value, str) or not value.strip():
-                raise ValueError("Incomplete approved DOM settings")
         if any(not re.fullmatch(r"[a-z0-9.-]+", host) for host in self.asset_hosts):
             raise ValueError("Invalid approved asset hostname")
+
+    @property
+    def can_add(self) -> bool:
+        return self.add_path is not None and bool(self.add_fields)
+
+    @property
+    def can_clear(self) -> bool:
+        return self.clear_path is not None and bool(self.clear_items_field)
+
+    @property
+    def can_write(self) -> bool:
+        return self.can_add and self.can_clear
+
+    def read_scopes(self) -> dict[tuple[str, str | None, int | None], tuple[str, ...]]:
+        home = _origin(urlsplit(self.home_url))
+        cart_url = urlsplit(self.cart_url)
+        cart = _origin(cart_url)
+        if home == cart:
+            return {home: (*self.read_paths, *self.cart_read_paths)}
+        cart_paths = self.cart_read_paths or (re.escape(cart_url.path or "/"),)
+        return {home: self.read_paths, cart: cart_paths}
 
 
 LOCAL_DOM = {
@@ -279,9 +347,10 @@ SNAPSHOT = r"""
     el.innerText || el.getAttribute("placeholder") || el.getAttribute("title"));
   const key = (el, attr = cfg.key_attr) => clean(el?.getAttribute(attr));
   const href = (el) => el.tagName === "A" ? el.href : null;
+  const quantityControl = (el) => el.matches('input[type=number], input[type=text], select');
   const fieldData = (root) => Object.fromEntries(Object.entries(cfg.fields).map(([name, selector]) =>
     [name, find(root, selector).slice(0, 15).map(el => ({
-      text: clean(el.innerText),
+      text: clean(name === "quantity" && quantityControl(el) ? el.value : el.innerText),
       unit: clean(cfg.unit_attr && el.getAttribute(cfg.unit_attr)),
     }))]));
   const blocked = Boolean(first(document, cfg.views.blocked) || first(document,
@@ -292,7 +361,7 @@ SNAPSHOT = r"""
   const view = blocked ? "blocked" :
     (["cart", "detail", "results", "home"].find(name => first(document, cfg.views[name])) || "unknown");
   if (blocked) return {root: document.documentElement, nodes: [], payload: {
-    view, controls: [], offers: [], rows: [], empty: false,
+    view, controls: [], offers: [], rows: [], quantities: [], empty: false,
   }};
   const nodes = [];
   const controls = [];
@@ -302,7 +371,7 @@ SNAPSHOT = r"""
       const name = label(el);
       if (/바로\s*구매|주문하기|결제하기|buy\s*now|checkout|place\s*order/i.test(name)) continue;
       if (role === "search-input" && !el.matches('input[type=search], input[type=text], input:not([type])')) continue;
-      if (role === "quantity" && !el.matches('input[type=number], select')) continue;
+      if (role === "quantity" && (!quantityControl(el) || el.readOnly)) continue;
       if (["card", "cart"].includes(role) && el.tagName !== "A") continue;
       if (["search-submit", "option", "add", "clear-cart"].includes(role) &&
           !el.matches('button, [role=button], input[type=submit]')) continue;
@@ -338,8 +407,10 @@ SNAPSHOT = r"""
     clear_id: cfg.clear_row_id_attr ? key(row, cfg.clear_row_id_attr) : "",
     fields: fieldData(row),
   })) : [];
+  const quantities = view === "detail" ? find(document, cfg.controls.quantity)
+    .filter(quantityControl).map(el => clean(el.value)) : [];
   return {root: document.documentElement, nodes, payload: {
-    view, controls, offers, rows, empty: view === "cart" && Boolean(first(document, cfg.empty)),
+    view, controls, offers, rows, quantities, empty: view === "cart" && Boolean(first(document, cfg.empty)),
   }};
 }
 """
@@ -443,6 +514,7 @@ class BrowserAdapter:
         self._epoch = 0
         self._routing = False
         self._network_blocked = False
+        self._blocked_status: int | None = None
         self._pending_path: str | None = None
         self._write_dispatched = False
         self._write_blocked = False
@@ -470,6 +542,8 @@ class BrowserAdapter:
             self._add_fields = {"product": "product", "option": "option", "quantity": "quantity"}
             self._clear_path = "/store/cart/clear"
             self._clear_items_field = "cart"
+            self._read_scopes = {_origin(parsed): self._read_paths}
+            self._write_origins = {self._add_path: _origin(parsed), self._clear_path: _origin(parsed)}
             self._dom = LOCAL_DOM
         elif mode == "coupang" and approval:
             if not isinstance(approval, CoupangApproval):
@@ -487,39 +561,68 @@ class BrowserAdapter:
             self._add_fields = approval.add_fields
             self._clear_path = approval.clear_path
             self._clear_items_field = approval.clear_items_field
+            self._read_scopes = approval.read_scopes()
+            self._write_origins = {}
+            if self._add_path:
+                self._write_origins[self._add_path] = _origin(
+                    urlsplit(approval.add_origin or self.home_url)
+                )
+            if self._clear_path:
+                self._write_origins[self._clear_path] = _origin(
+                    urlsplit(approval.clear_origin or self.cart_url)
+                )
             self._dom = approval.dom
             self._asset_hosts = approval.asset_hosts
         else:
             raise BrowserBlocked("쿠팡 실사이트 실행에는 쿠팡 승인 범위와 승인된 화면 설정이 필요합니다.")
-        self._shop_origin = _origin(urlsplit(self.home_url))
+
+    @property
+    def can_add(self) -> bool:
+        return self._add_path is not None and bool(self._add_fields)
+
+    @property
+    def can_clear(self) -> bool:
+        return self._clear_path is not None and bool(self._clear_items_field)
+
+    @property
+    def can_write(self) -> bool:
+        return self.can_add and self.can_clear
 
     def _in_scope(self, url: str) -> bool:
         try:
             parsed = urlsplit(url)
             path = parsed.path or "/"
             return (
-                _origin(parsed) == self._shop_origin
-                and not (parsed.username or parsed.password or parsed.fragment)
+                parsed.username is None
+                and parsed.password is None
+                and not parsed.fragment
                 and "%" not in path
                 and not BLOCKED_PATH.search(path)
                 and not FORBIDDEN_PATH.search(path)
-                and any(re.fullmatch(rule, path) for rule in self._read_paths)
+                and any(re.fullmatch(rule, path) for rule in self._read_scopes.get(_origin(parsed), ()))
             )
         except ValueError:
             return False
 
     def _is_write_url(self, url: str, path: str) -> bool:
-        parsed = urlsplit(url)
-        return (
-            _origin(parsed) == self._shop_origin
-            and parsed.path == path
-            and not (parsed.username or parsed.password or parsed.query or parsed.fragment)
-        )
+        try:
+            parsed = urlsplit(url)
+            return (
+                _origin(parsed) == self._write_origins[path]
+                and parsed.path == path
+                and parsed.username is None
+                and parsed.password is None
+                and not (parsed.query or parsed.fragment)
+            )
+        except (ValueError, KeyError):
+            return False
 
     async def _route(self, route: Route) -> None:
         request = route.request
         url = request.url
-        if request.method == "POST" and self._pending_path and self._is_write_url(url, self._pending_path):
+        if request.method == "OPTIONS" and self._allowed_preflight(url, request.headers):
+            await route.continue_()
+        elif request.method == "POST" and self._pending_path and self._is_write_url(url, self._pending_path):
             self._pending_path = None
             if not self._correct_write(request.post_data, request.headers.get("content-type", "")):
                 self._write_blocked = True
@@ -552,7 +655,7 @@ class BrowserAdapter:
         } and not request.is_navigation_request():
             parsed = urlsplit(url)
             if (
-                _origin(parsed) == self._shop_origin
+                _origin(parsed) in self._read_scopes
                 or (parsed.scheme == "https" and parsed.hostname in self._asset_hosts)
             ) and not FORBIDDEN_PATH.search(parsed.path):
                 await route.continue_()
@@ -562,6 +665,19 @@ class BrowserAdapter:
             if request.is_navigation_request():
                 self._network_blocked = True
             await route.abort()
+
+    def _allowed_preflight(self, url: str, headers: dict[str, str]) -> bool:
+        try:
+            source = _origin(urlsplit(headers.get("origin", "")))
+        except ValueError:
+            return False
+        if source not in self._read_scopes:
+            return False
+        method = headers.get("access-control-request-method")
+        return (
+            (method == "GET" and self._in_scope(url))
+            or (method == "POST" and self._pending_path is not None and self._is_write_url(url, self._pending_path))
+        )
 
     def _correct_write(self, body: str | None, content_type: str) -> bool:
         if body is None:
@@ -603,8 +719,9 @@ class BrowserAdapter:
             self._routing = True
 
     def _on_response(self, response) -> None:
-        if response.status in {401, 403, 429} and response.request.is_navigation_request():
+        if response.status in _ACCESS_REASON and response.request.is_navigation_request():
             self._network_blocked = True
+            self._blocked_status = response.status
 
     def _step(self, *, before_add: bool = False, recovery: bool = False) -> None:
         # Leave room for opening the cart and the final verification decision.
@@ -617,6 +734,9 @@ class BrowserAdapter:
         self.steps += 1
 
     def _require_current_url(self) -> None:
+        if self._blocked_status is not None:
+            status = self._blocked_status
+            raise BrowserBlocked(f"{_ACCESS_REASON[status]} (HTTP {status}).")
         if self._network_blocked or not self._in_scope(self.page.url):
             raise BrowserBlocked("로그인·접근 제한 또는 승인 범위 밖으로 이동이 감지됐습니다.")
 
@@ -626,6 +746,7 @@ class BrowserAdapter:
         await self._initialize()
         self._active = None
         self._network_blocked = False
+        self._blocked_status = None
         for attempt in range(2):
             self._step(recovery=recovery)
             try:
@@ -635,13 +756,13 @@ class BrowserAdapter:
                 break
             except PlaywrightError as exc:
                 if self._network_blocked:
-                    raise BrowserBlocked("로그인 또는 허용 범위 밖으로 이동이 감지됐습니다.") from exc
+                    self._require_current_url()
                 if attempt or self.page.is_closed():
                     raise BrowserError("상점 화면을 열지 못했습니다.") from exc
-        self._require_current_url()
-        if response is not None and response.status in {401, 403, 429}:
+        if response is not None and response.status in _ACCESS_REASON:
             self._network_blocked = True
-            raise BrowserBlocked("상점에서 로그인 또는 접근 제한을 알렸습니다.")
+            self._blocked_status = response.status
+        self._require_current_url()
 
     async def open_home(self) -> None:
         await self._goto(self.home_url)
@@ -702,6 +823,8 @@ class BrowserAdapter:
             if (
                 item["destination"] not in {"", "_self"}
                 or role not in VIEW_ROLES[data["view"]]
+                or (role == "add" and not self.can_add)
+                or (role == "clear-cart" and not self.can_clear)
                 or (url and not self._in_scope(url))
                 or (role in {"card", "option"} and not SAFE_KEY.fullmatch(item["key"]))
             ):
@@ -764,13 +887,17 @@ class BrowserAdapter:
             if not (SAFE_KEY.fullmatch(product_id) and SAFE_KEY.fullmatch(option_id)):
                 continue
             capacity, unit = _capacity(fields)
+            option = _text(fields, "option")
+            pack_count, contents = self._pack_evidence(fields, option)
+            if capacity is None and contents is not None:
+                capacity, unit = contents, "piece"
             result.append(Offer(
                 product_id=product_id,
                 option_id=option_id,
                 title=_text(fields, "name") or _text(common, "name"),
-                label=_text(fields, "option"),
-                unit_price=_number(_text(fields, "price"), "원"),
-                pack_count=_number(_text(fields, "pack"), "개|팩|매|세트|봉|병"),
+                label=option,
+                unit_price=self._price(fields),
+                pack_count=pack_count,
                 capacity=capacity,
                 capacity_unit=unit,
                 stock=_stock(_text(fields, "stock")),
@@ -783,6 +910,21 @@ class BrowserAdapter:
             ))
         return tuple(result)
 
+    def _price(self, fields: dict) -> int | None:
+        text = _text(fields, "price")
+        if self.mode == "coupang":
+            return parse_price(text, current_text=_text(fields, "current-price") or None)
+        return _number(text, "원")
+
+    def _pack_evidence(self, fields: dict, option: str) -> tuple[int | None, int | None]:
+        pack = _number(_text(fields, "pack"), r"(?:개|팩|매|세트|봉|병)(?:\s*구성)?")
+        if self.mode != "coupang":
+            return pack, None
+        parsed = parse_pack(option, (*_texts(fields, "specs"), *_texts(fields, "attributes")))
+        if pack is not None and parsed.packages_per_order not in {None, pack}:
+            return None, None
+        return pack or parsed.packages_per_order, parsed.total_contents
+
     async def details(self) -> tuple[Offer, ...]:
         data = await self._read()
         if data["view"] != "detail":
@@ -792,16 +934,16 @@ class BrowserAdapter:
     async def read_cart(self) -> tuple[CartLine, ...]:
         return self._cart_lines(await self._read())
 
-    @staticmethod
-    def _cart_lines(data: dict) -> tuple[CartLine, ...]:
+    def _cart_lines(self, data: dict) -> tuple[CartLine, ...]:
         if data["view"] != "cart" or bool(data["rows"]) == data["empty"]:
             raise BrowserError("장바구니 상품과 빈 장바구니 여부를 확인할 수 없습니다.")
         lines: list[CartLine] = []
         for row in data["rows"]:
             fields = row["fields"]
             p_id, o_id = row["product_id"], row["option_id"]
-            price = _number(_text(fields, "price"), "원")
-            count = _number(_text(fields, "quantity"), "개|팩|세트")
+            price = self._price(fields)
+            quantity = _text(fields, "quantity")
+            count = parse_quantity(quantity) if self.mode == "coupang" else _number(quantity, "개|팩|세트")
             title, label = _text(fields, "name"), _text(fields, "option")
             if not (
                 SAFE_KEY.fullmatch(p_id) and SAFE_KEY.fullmatch(o_id)
@@ -810,7 +952,7 @@ class BrowserAdapter:
                 raise BrowserError("장바구니에서 상품, 옵션, 가격 또는 수량을 확인할 수 없습니다.")
             lines.append(CartLine(
                 p_id, o_id, title, label, price, count,
-                _number(_text(fields, "pack"), r"(?:개|팩|매|세트|봉|병)(?:\s*구성)?"),
+                self._pack_evidence(fields, label)[0],
                 _text(fields, "shipping"),
                 _shipping_fee(_text(fields, "shipping-price")),
             ))
@@ -908,7 +1050,7 @@ class BrowserAdapter:
         quantity: int | None,
     ) -> None:
         selected = [offer for offer in self._offers(data) if offer.selected]
-        quantities = [control["value"] for control in data["controls"] if control["role"] == "quantity"]
+        quantities = data["quantities"]
         if (
             data["view"] != "detail"
             or expected is None
@@ -923,6 +1065,8 @@ class BrowserAdapter:
             raise StaleObservation("추가 직전 상품·옵션·수량·가격을 다시 확인해야 합니다.")
 
     async def _add(self, node: ElementHandle, offer: Offer, quantity: int) -> None:
+        if self._add_path is None or self._add_fields is None:
+            raise BrowserBlocked("승인된 쿠팡 비회원 장바구니 담기 요청 형식을 확인할 수 없습니다.")
         expected = {
             self._add_fields["product"]: offer.product_id,
             self._add_fields["option"]: offer.option_id,
@@ -987,9 +1131,10 @@ class BrowserAdapter:
             ) as response_info:
                 await node.click(timeout=self.action_timeout_ms)
             response = await response_info.value
-            if response.status in {401, 403, 429}:
+            if response.status in _ACCESS_REASON:
                 self._network_blocked = True
-                raise BrowserBlocked("상점에서 로그인 또는 접근 제한을 알렸습니다.")
+                self._blocked_status = response.status
+                self._require_current_url()
             if response.status >= 400:
                 raise ambiguous("상점 응답을 장바구니에서 다시 확인해야 합니다.")
             await self.page.wait_for_load_state("domcontentloaded", timeout=self.action_timeout_ms)
@@ -1003,7 +1148,7 @@ class BrowserAdapter:
                 )
                 raise BrowserBlocked(message) from exc
             if self._network_blocked:
-                raise BrowserBlocked("로그인 또는 승인 범위 밖으로 이동이 감지됐습니다.") from exc
+                self._require_current_url()
             raise ambiguous("변경 반영 여부를 장바구니에서 먼저 확인해야 합니다.") from exc
         finally:
             self._pending_path = None

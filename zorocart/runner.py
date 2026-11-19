@@ -13,7 +13,7 @@ from uuid import uuid4
 
 from playwright.async_api import async_playwright
 
-from .browser import BrowserAdapter
+from .browser import BrowserAdapter, CoupangApproval
 from .engine import ShoppingEngine
 from .model import ZoroClient
 from .store import COOKIE as DEMO_CART_COOKIE
@@ -102,8 +102,12 @@ async def execute_run(run: Run, store_url: str, *, headless=False, interactive=F
                       demo_cart_session: str | None = None):
     engine = None
     browser_context = None
-    if run.environment == 'coupang' and (approval is None or profile_dir is None):
-        raise ValueError('쿠팡 모드에는 쿠팡 승인 범위 설정과 전용 브라우저 프로필이 필요합니다.')
+    if run.environment == 'coupang':
+        if approval is None or profile_dir is None or headless:
+            raise ValueError('쿠팡 모드에는 쿠팡 승인 범위, 전용 프로필, 보이는 브라우저가 필요합니다.')
+        if not isinstance(approval, CoupangApproval):
+            approval = CoupangApproval.from_file(approval)
+        approval.validate()
     if demo_cart_session is not None and run.environment != 'local':
         raise ValueError('시연 장바구니 세션은 로컬 상점에서만 사용할 수 있습니다.')
     deadline = time.monotonic() + timeout
@@ -124,8 +128,13 @@ async def execute_run(run: Run, store_url: str, *, headless=False, interactive=F
             for existing in browser_context.pages:
                 if existing != page:
                     await existing.close()
-            adapter = BrowserAdapter(page, store_url, mode=run.environment, approval=approval,
-                                     max_steps=max_steps, deadline=deadline)
+            adapter_class = BrowserAdapter
+            if run.environment == 'coupang' and approval.desktop_ui:
+                from .coupang_live import CoupangDesktopAdapter
+
+                adapter_class = CoupangDesktopAdapter
+            adapter = adapter_class(page, store_url, mode=run.environment, approval=approval,
+                                    max_steps=max_steps, deadline=deadline)
             if demo_cart_session is not None:
                 origin = urlsplit(adapter.home_url)
                 await browser_context.add_cookies([{'name': DEMO_CART_COOKIE, 'value': demo_cart_session,
