@@ -6,11 +6,11 @@ from pathlib import Path
 from secrets import compare_digest, token_urlsafe
 
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel, Field
 
 from .runner import Run, SCENARIOS, execute_run
-from .store import router
+from .store import get_session, router, with_session
 
 
 class NewRun(BaseModel):
@@ -43,11 +43,13 @@ def create_app(*, store_url: str, log_dir: Path, headless: bool = False) -> Fast
             raise HTTPException(403, '이 대시보드에서 다시 요청하세요.')
 
     @app.get('/', response_class=HTMLResponse)
-    async def dashboard():
+    async def dashboard(request: Request):
+        cart_session, _ = get_session(request)
         html = Path(__file__).with_name('dashboard.html').read_text(encoding='utf-8')
-        return HTMLResponse(html.replace('__DASHBOARD_TOKEN__', dashboard_token), headers={
+        response = HTMLResponse(html.replace('__DASHBOARD_TOKEN__', dashboard_token), headers={
             'Cache-Control': 'no-store', 'X-Frame-Options': 'DENY', 'Referrer-Policy': 'no-referrer',
         })
+        return with_session(response, cart_session)
 
     @app.get('/api/scenarios')
     async def scenarios(request: Request):
@@ -63,12 +65,14 @@ def create_app(*, store_url: str, log_dir: Path, headless: bool = False) -> Fast
             raise HTTPException(422, '쇼핑 요청을 입력하세요.')
         if len(runs) >= 40:
             del runs[next(iter(runs))]
+        cart_session, _ = get_session(request)
         run = Run(data.request.strip())
         runs[run.id] = run
 
         async def work():
             try:
-                await execute_run(run, store_url, headless=headless, interactive=True)
+                await execute_run(run, store_url, headless=headless, interactive=True,
+                                  demo_cart_session=cart_session)
             finally:
                 run.save(log_dir / f'{run.id}.json')
 
@@ -83,7 +87,7 @@ def create_app(*, store_url: str, log_dir: Path, headless: bool = False) -> Fast
                     run.event('log_error', error_type=type(error).__name__)
 
         task.add_done_callback(finished)
-        return {'id': run.id}
+        return with_session(JSONResponse({'id': run.id}, status_code=202), cart_session)
 
     def lookup(run_id: str) -> Run:
         if run_id not in runs:

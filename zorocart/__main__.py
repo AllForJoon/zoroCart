@@ -56,11 +56,18 @@ def check_result(scenario: str, artifact: dict) -> tuple[bool, bool | None]:
     }
     requirements, budget = expected[scenario]
     checks = [event for event in artifact['events'] if event['kind'] == 'cart_verification']
-    writes = [event for event in artifact['events'] if event['kind'] == 'browser_decision'
-              and event.get('stage') == '검증한 판매 옵션과 수량을 장바구니에 담기']
-    unchanged = all(event['preexisting_preserved'] for event in checks)
-    if unchanged and writes and (not checks or writes[-1]['elapsed_ms'] > checks[-1]['elapsed_ms']):
-        unchanged = None
+    additions = [event for event in artifact['events'] if event['kind'] == 'browser_decision'
+                 and event.get('stage') == '검증한 판매 옵션과 수량을 장바구니에 담기']
+    clear_attempted = any(event['kind'] == 'browser_decision' and event.get('stage') == '기존 장바구니 비우기'
+                          for event in artifact['events'])
+    reset_verified = 'cart_reset' not in result or (result['cart_reset'] or {}).get('status') == 'verified'
+    expected_changes = all(event.get('expected_changes_only', event.get('preexisting_preserved', False))
+                           for event in checks)
+    if any(event['kind'] == 'cart_changed_after_reset' for event in artifact['events']):
+        expected_changes = False
+    if expected_changes and ((clear_attempted and not reset_verified) or
+                             (additions and (not checks or additions[-1]['elapsed_ms'] > checks[-1]['elapsed_ms']))):
+        expected_changes = None
     def item_type(row):
         text = row['title'] + ' ' + row['option']
         if '물티슈' in text and '무향' in text:
@@ -99,7 +106,7 @@ def check_result(scenario: str, artifact: dict) -> tuple[bool, bool | None]:
                             or (unit == 'serving' and capacity >= 2))
     return (result['status'] == 'complete' and len(rows) == 2 and set(items) == requirements
             and quantity_ok and result['merchandise_total'] <= budget and bool(checks)
-            and unchanged is True), unchanged
+            and reset_verified and expected_changes is True), expected_changes
 
 
 async def command(args: argparse.Namespace) -> int:
@@ -131,16 +138,17 @@ async def command(args: argparse.Namespace) -> int:
             run = Run(SCENARIOS[scenario])
             await execute_run(run, args.store_url, timeout=args.timeout, headless=not args.headed)
             artifact = run.artifact()
-            passed, unchanged = check_result(scenario, artifact)
+            passed, expected_changes = check_result(scenario, artifact)
             run.save(args.output / f'{scenario}-{number}.json')
-            runs.append({'run': number, 'passed': passed, 'preexisting_preserved': unchanged,
+            runs.append({'run': number, 'passed': passed, 'expected_changes_only': expected_changes,
+                         'cart_reset': run.result['cart_reset'],
                          'status': run.result['status'], 'reason': run.result['reason'], **artifact['metrics']})
             print(json.dumps({'scenario': scenario, **runs[-1]}, ensure_ascii=False), flush=True)
             if passed and not (args.output / f'{scenario}.json').exists():
                 run.save(args.output / f'{scenario}.json')
         report[scenario] = {'passed': sum(r['passed'] for r in runs), 'runs': args.runs,
-                            'unintended_changes': sum(r['preexisting_preserved'] is False for r in runs),
-                            'unverified_cart_runs': sum(r['preexisting_preserved'] is None for r in runs),
+                            'unintended_changes': sum(r['expected_changes_only'] is False for r in runs),
+                            'unverified_cart_runs': sum(r['expected_changes_only'] is None for r in runs),
                             'mean_elapsed_ms': round(mean(r['elapsed_ms'] for r in runs)), 'details': runs}
     (args.output / 'summary.json').write_text(json.dumps(report, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')
     return 0 if all(entry['passed'] * 5 >= entry['runs'] * 4 and not entry['unintended_changes']

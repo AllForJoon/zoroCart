@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import re
 import time
+from urllib.parse import urlsplit
 from uuid import uuid4
 
 from playwright.async_api import async_playwright
@@ -15,6 +16,7 @@ from playwright.async_api import async_playwright
 from .browser import BrowserAdapter
 from .engine import ShoppingEngine
 from .model import ZoroClient
+from .store import COOKIE as DEMO_CART_COOKIE
 
 CHECKPOINT = 'bf1b76b9b4df03b05fcbb73444e1cd4db0f566da'
 SERVING_COMMIT = '0ddcf516e458a82892d7fe0d0dabeb113d3cf424'
@@ -96,11 +98,14 @@ class Run:
 
 
 async def execute_run(run: Run, store_url: str, *, headless=False, interactive=False,
-                      timeout=420, max_steps=140, approval=None, profile_dir: Path | None = None):
+                      timeout=420, max_steps=140, approval=None, profile_dir: Path | None = None,
+                      demo_cart_session: str | None = None):
     engine = None
     browser_context = None
     if run.environment == 'coupang' and (approval is None or profile_dir is None):
         raise ValueError('쿠팡 모드에는 쿠팡 승인 범위 설정과 전용 브라우저 프로필이 필요합니다.')
+    if demo_cart_session is not None and run.environment != 'local':
+        raise ValueError('시연 장바구니 세션은 로컬 상점에서만 사용할 수 있습니다.')
     deadline = time.monotonic() + timeout
     try:
         async with asyncio.timeout(timeout), async_playwright() as pw:
@@ -121,6 +126,11 @@ async def execute_run(run: Run, store_url: str, *, headless=False, interactive=F
                     await existing.close()
             adapter = BrowserAdapter(page, store_url, mode=run.environment, approval=approval,
                                      max_steps=max_steps, deadline=deadline)
+            if demo_cart_session is not None:
+                origin = urlsplit(adapter.home_url)
+                await browser_context.add_cookies([{'name': DEMO_CART_COOKIE, 'value': demo_cart_session,
+                                                   'url': f'{origin.scheme}://{origin.netloc}/',
+                                                   'httpOnly': True, 'sameSite': 'Strict'}])
             async with ZoroClient(os.environ.get('ZORO_URL', 'http://127.0.0.1:30001'),
                                   model=os.environ.get('ZORO_MODEL', CHECKPOINT),
                                   api_key=os.environ.get('ZORO_API_KEY'), event=run.event,
@@ -140,7 +150,8 @@ async def execute_run(run: Run, store_url: str, *, headless=False, interactive=F
         if engine:
             run.result = engine.result('partial' if engine.verified else 'held', reason)
         else:
-            run.result = {'status': 'error', 'reason': reason, 'added': [], 'merchandise_total': 0, 'remaining': []}
+            run.result = {'status': 'error', 'reason': reason, 'cart_reset': None,
+                          'added': [], 'merchandise_total': 0, 'remaining': []}
     except Exception as exc:
         # Raw transport/Playwright errors can contain request bodies, URLs, or session state.
         run.event('run_error', error_type=type(exc).__name__)
@@ -148,7 +159,8 @@ async def execute_run(run: Run, store_url: str, *, headless=False, interactive=F
         if exc.__class__.__module__.startswith('zorocart.'):
             reason = sanitized(str(exc))[:250]
         run.result = (engine.result('partial' if engine.verified else 'held', reason) if engine else
-                      {'status': 'error', 'reason': reason, 'added': [], 'merchandise_total': 0, 'remaining': []})
+                      {'status': 'error', 'reason': reason, 'cart_reset': None,
+                       'added': [], 'merchandise_total': 0, 'remaining': []})
     run.result = sanitized(run.result)
     run.event('run_finished', status=run.result['status'])
     return run.result

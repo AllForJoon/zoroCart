@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 from collections import OrderedDict
 from dataclasses import dataclass, field, replace
@@ -10,7 +11,7 @@ from html import escape
 from secrets import token_urlsafe
 from urllib.parse import parse_qs
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Request, Response
 from fastapi.responses import HTMLResponse, RedirectResponse
 
 router = APIRouter(prefix="/store")
@@ -133,7 +134,7 @@ BUDGET_INCREASE = {
 }
 FAULTS = frozenset({
     "budget", "sold-out", "spec-mismatch", "missing-info", "stale-target",
-    "add-timeout-applied", "add-timeout-unapplied", "price-change", "blocked",
+    "add-timeout-applied", "add-timeout-unapplied", "price-change", "clear-mismatch", "blocked",
 })
 COOKIE = "zorocart_demo_session"
 ADD_RESPONSE_DELAY_SECONDS = 15
@@ -148,7 +149,7 @@ class Session:
     })
     fault: str = ""
     adds: int = 0
-    cart_opened: bool = False
+    detail_visits: dict[str, int] = field(default_factory=dict)
 
 
 _sessions: OrderedDict[str, Session] = OrderedDict()
@@ -169,7 +170,7 @@ def get_session(request: Request) -> tuple[str, Session]:
     return key, session
 
 
-def with_session(response: HTMLResponse | RedirectResponse, key: str):
+def with_session(response: Response, key: str) -> Response:
     response.set_cookie(COOKIE, key, httponly=True, samesite="strict")
     response.headers["Cache-Control"] = "no-store"
     return response
@@ -372,7 +373,12 @@ async def detail(request: Request, product_id: str):
     name = attribute("name", product.name, product.name)
     category = attribute("category", product.category, product.category)
     no_stock = "disabled" if not first.stock else ""
-    stale_delay = STALE_OPTION_DELAY_MS if session.fault == "stale-target" and session.cart_opened else 0
+    stale_delay = 0
+    if session.fault == "stale-target":
+        visits = session.detail_visits.get(product.id, 0) + 1
+        session.detail_visits[product.id] = visits
+        if visits >= 3:
+            stale_delay = STALE_OPTION_DELAY_MS
     return view(key, session, "detail", product.name, f"""
 <div class="detail" data-zc-product data-zc-id="{product.id}">
 <div class="product-image detail-image" aria-hidden="true">{product.emoji}</div>
@@ -419,12 +425,30 @@ async def add_to_cart(request: Request):
     return with_session(RedirectResponse("/store/cart", status_code=303), key)
 
 
+def cart_snapshot(session: Session) -> str:
+    rows = [(product_id, option_id, quantity)
+            for (product_id, option_id), quantity in sorted(session.cart.items())]
+    return json.dumps(rows, separators=(",", ":"))
+
+
+@router.post("/cart/clear")
+async def clear_cart(request: Request):
+    key, session = get_session(request)
+    if session.fault == "blocked":
+        return blocked(key, session)
+    form = parse_qs((await request.body()).decode("utf-8", errors="replace"), keep_blank_values=True)
+    if session.fault == "clear-mismatch" or not session.cart or form != {"cart": [cart_snapshot(session)]}:
+        return view(key, session, "cart", "장바구니 비우기 보류", """
+<h1>장바구니 비우기 보류</h1><p>지금 장바구니와 요청에 포함된 품목을 대조할 수 없습니다.</p>""", status=409)
+    session.cart.clear()
+    return with_session(RedirectResponse("/store/cart", status_code=303), key)
+
+
 @router.get("/cart")
 async def cart(request: Request):
     key, session = get_session(request)
     if session.fault == "blocked":
         return blocked(key, session)
-    session.cart_opened = True
     rows = []
     subtotal = 0
     for (product_id, option_id), quantity in session.cart.items():
@@ -448,7 +472,13 @@ async def cart(request: Request):
 <th scope="col">상품 및 옵션</th><th scope="col">옵션 가격</th><th scope="col">주문 수량</th>
 <th scope="col">배송</th><th scope="col">상품가</th></tr></thead>
 <tbody>{"".join(rows)}</tbody></table></div>
-<p class="cart-total">장바구니 상품가 합계 <strong>{attribute("subtotal", money(subtotal), subtotal)}</strong></p>"""
+<div class="cart-controls">
+<form action="/store/cart/clear" method="post">
+<input type="hidden" name="cart" value="{escape(cart_snapshot(session))}">
+<button type="submit" class="clear-cart" data-zc-control="clear-cart">장바구니 비우기</button>
+</form>
+<p class="cart-total">장바구니 상품가 합계 <strong>{attribute("subtotal", money(subtotal), subtotal)}</strong></p>
+</div>"""
     if not rows:
         content = '<p class="empty" data-zc-empty>장바구니가 비어 있습니다.</p>'
     return view(key, session, "cart", "장바구니", f'<h1>장바구니</h1>{content}')
@@ -528,7 +558,10 @@ h1 small{font-size:19px;color:var(--muted)}h2{font-size:18px;letter-spacing:-.03
   text-align:left}th,td{padding:12px;border-bottom:1px solid var(--line)}
 thead th{color:var(--muted);font-size:14px;font-weight:650}tbody th{min-width:220px}
 tbody small{display:block;color:var(--muted);font-weight:400}
-.cart-total{display:flex;justify-content:flex-end;gap:12px;margin-top:20px}.empty{padding:18px;
+.cart-controls{display:flex;align-items:center;justify-content:space-between;gap:12px;
+  flex-wrap:wrap;margin-top:18px}.cart-total{display:flex;gap:12px;margin:0}
+.clear-cart{padding:8px 12px;color:#8a321c;background:var(--white);border:1px solid #e4c9bd}
+.clear-cart:hover{background:#faeee8}.empty{padding:18px;
   background:var(--white);border:1px solid var(--line);border-radius:8px}
 @media(max-width:690px){.shell{width:calc(100% - 28px)}.nav{gap:10px}.detail{grid-template-columns:1fr}
   .detail-image{min-height:115px}.hero{padding-top:16px}}

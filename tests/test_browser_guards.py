@@ -45,7 +45,7 @@ def test_transient_read_navigation_retries_once():
     assert page.url == adapter.home_url
 
 
-def test_browser_revalidates_nodes_and_add_payload():
+def test_browser_revalidates_nodes_and_cart_write_payloads():
     asyncio.run(exercise_browser_guards())
 
 
@@ -125,6 +125,24 @@ async def assert_browser_guards(adapter, page):
         key = (line.product_id, line.option_id)
         assert cart[key].quantity == line.quantity + (key == identity)
     assert cart[identity].unit_price == offer.unit_price
+
+    before_clear = await adapter.read_cart()
+    with pytest.raises(StaleObservation):
+        await step("clear-cart", expected_cart=baseline)
+    assert await adapter.read_cart() == before_clear
+
+    await page.locator('input[name="cart"]').evaluate(
+        "element => { element.value = '[]' }"
+    )
+    with pytest.raises(BrowserBlocked, match="삭제 대상"):
+        await step("clear-cart", expected_cart=before_clear)
+    await adapter.open_cart()
+    assert await adapter.read_cart() == before_clear
+
+    await step("clear-cart", expected_cart=before_clear)
+    await adapter.open_cart()
+    assert await adapter.read_cart() == ()
+    assert all(t.role != "clear-cart" for t in (await adapter.observe()).targets)
 
     with pytest.raises(BrowserBlocked):
         await adapter.open_product(adapter.home_url + "/checkout")

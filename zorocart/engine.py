@@ -7,7 +7,7 @@ from math import ceil
 import re
 from typing import Any, Awaitable, Callable
 
-from .browser import AmbiguousAdd, BrowserAdapter, BrowserError, StaleObservation
+from .browser import AmbiguousAdd, AmbiguousClear, BrowserAdapter, BrowserError, CartLine, StaleObservation
 from .model import ModelError, ZoroClient
 from .planning import ShoppingItem, ShoppingPlan, generate_search_query, plan_purchase
 
@@ -97,7 +97,7 @@ class ShoppingEngine:
         self.client, self.browser, self.event = client, browser, event
         self.score_threshold, self.choice_threshold = score_threshold, choice_threshold
         self.confirm = confirm
-        self.baseline: tuple | None = None
+        self.cart_reset: dict | None = None
         self.previous: dict[str, Any] | None = None
         self.selections: dict[tuple, Candidate] = {}
         self.verified: dict[tuple, dict] = {}
@@ -108,7 +108,7 @@ class ShoppingEngine:
 
     async def step(self, role: str | None, phase: str, *, key: str | None = None, value=None,
                    expected: Candidate | None = None, alternate_keys: set[str] | None = None,
-                   blocked: bool = True, value_factory=None):
+                   blocked: bool = True, value_factory=None, expected_cart: tuple[CartLine, ...] | None = None):
         stale = 0
         for advance in range(4):
             obs = await self.browser.observe()
@@ -139,7 +139,8 @@ class ShoppingEngine:
             try:
                 await self.browser.execute(obs, chosen, target_id, value if chosen == action else None,
                                            expected_offer=expected.offer if expected else None,
-                                           expected_quantity=expected.quantity if expected else None)
+                                           expected_quantity=expected.quantity if expected else None,
+                                           expected_cart=expected_cart)
             except StaleObservation:
                 self.event('stale_observation', **self.previous)
                 self.previous = {**self.previous, 'result': 'stale'}
@@ -152,6 +153,30 @@ class ShoppingEngine:
             if chosen not in {'SCROLL', 'WAIT'}:
                 return next((target for target in targets if target.id == target_id), None)
         raise Hold(f'{phase} 단계의 화면을 확정하지 못했습니다.')
+
+    async def reset_cart(self):
+        await self.browser.open_home()
+        await self.browser.open_cart()
+        before = await self.browser.read_cart()
+        counts = {'before_lines': len(before), 'before_units': sum(line.quantity for line in before)}
+        self.cart_reset = {'status': 'pending', **counts}
+        self.event('cart_reset_started', **counts)
+        if before:
+            if len({self.key(line) for line in before}) != len(before):
+                raise Hold('초기화할 장바구니 상품을 판매 옵션별로 구분할 수 없습니다.')
+            try:
+                await self.step('clear-cart', '기존 장바구니 비우기', expected_cart=before)
+            except AmbiguousClear:
+                self.event('cart_reset_uncertain')
+            await self.browser.open_cart()
+            after = await self.browser.read_cart()
+            if after:
+                self.cart_reset.update(status='incomplete', remaining_lines=len(after))
+                self.event('cart_reset_incomplete', remaining_lines=len(after))
+                raise Hold('장바구니에 상품이 남아 있어 초기화를 확인할 수 없습니다.')
+        removed = {'removed_lines': counts['before_lines'], 'removed_units': counts['before_units']}
+        self.cart_reset.update(status='verified', **removed)
+        self.event('cart_reset_verified', **removed)
 
     async def search(self, item: ShoppingItem, previous_query: str | None = None) -> tuple[str, list[Candidate]]:
         await self.browser.open_home()
@@ -287,37 +312,32 @@ class ShoppingEngine:
         return replace(current, selected=expected.selected) == expected
 
     def verify(self, cart: tuple) -> dict[tuple, dict]:
-        before = {self.key(line): line for line in self.baseline or ()}
         after = {self.key(line): line for line in cart}
-        if len(after) != len(cart) or len(before) != len(self.baseline or ()):
+        if len(after) != len(cart):
             raise Hold('장바구니에서 판매 옵션별 상품을 유일하게 식별할 수 없습니다.')
         verified = {}
         issues = []
-        for key in before.keys() | after.keys():
-            first, last = before.get(key), after.get(key)
-            delta = (last.quantity if last else 0) - (first.quantity if first else 0)
+        if self.verified.keys() - after.keys():
+            issues.append('앞서 확인한 상품의 추가분이 사라졌습니다.')
+        for key, last in after.items():
             selected = self.selections.get(key)
-            if delta < 0 or (delta and selected is None):
+            if selected is None:
                 issues.append('장바구니에서 이번 작업과 일치하지 않는 수량 변화가 확인됐습니다.')
                 continue
-            if delta == 0:
-                if key in self.verified:
-                    issues.append('앞서 확인한 상품의 추가분이 바뀌었습니다.')
-                continue
-            if (delta != selected.quantity or last.unit_price != selected.offer.unit_price
+            if (last.quantity != selected.quantity or last.unit_price != selected.offer.unit_price
                     or last.pack_count != selected.offer.pack_count or last.label != selected.offer.label
                     or (selected.offer.delivery and last.delivery != selected.offer.delivery)
                     or (self.plan.include_shipping and last.shipping_fee != selected.offer.shipping_fee)):
                 issues.append(f'{selected.offer.title}의 수량 또는 옵션·상품가 검증에 실패했습니다.')
                 continue
             verified[key] = {'product_id': last.product_id, 'option_id': last.option_id, 'title': last.title,
-                             'option': last.label, 'quantity': delta, 'unit_price': last.unit_price,
+                             'option': last.label, 'quantity': last.quantity, 'unit_price': last.unit_price,
                              'pack_count': last.pack_count, 'delivery': last.delivery, 'shipping_fee': last.shipping_fee,
                              'verified_attributes': list(selected.offer.attributes),
-                             'merchandise_total': last.unit_price * delta}
+                             'merchandise_total': last.unit_price * last.quantity}
         self.verified = verified
         self.event('cart_verification', rows=list(verified.values()), observed_cart=[asdict(line) for line in cart],
-                   issues=issues, preexisting_preserved=not issues)
+                   issues=issues, expected_changes_only=not issues)
         if issues:
             raise Hold(issues[0])
         return verified
@@ -405,6 +425,7 @@ class ShoppingEngine:
             if not self.items:
                 raise Hold('구매할 품목이 확인되지 않았습니다.')
             self.event('shopping_plan', plan=self.plan.model_dump())
+            await self.reset_cart()
             groups = []
             for item in self.items:
                 self.item = item
@@ -430,10 +451,11 @@ class ShoppingEngine:
                     if omitted.id not in included:
                         self.holds.setdefault(omitted.id, '승인된 일부 품목 범위에서 제외되었습니다.')
             candidates = await self.select(groups, items)
-            await self.browser.open_home()
-            await self.step('cart', '담기 전 기존 장바구니 수량 기록')
-            self.baseline = await self.browser.read_cart()
-            self.event('cart_baseline', rows=[asdict(line) for line in self.baseline])
+            await self.browser.open_cart()
+            if await self.browser.read_cart():
+                self.event('cart_changed_after_reset')
+                raise Hold('초기화 이후 장바구니에 다른 상품이 추가되어 담기를 중단했습니다.')
+            self.event('cart_baseline', rows=[])
             spent = 0
             for index, item in enumerate(items):
                 self.item = item
@@ -451,7 +473,7 @@ class ShoppingEngine:
 
     def result(self, status: str, reason: str | None = None) -> dict:
         completed = {self.item_by_key[key] for key in self.verified}
-        return {'status': status, 'reason': reason, 'added': list(self.verified.values()),
+        return {'status': status, 'reason': reason, 'cart_reset': self.cart_reset, 'added': list(self.verified.values()),
                 'merchandise_total': sum(row['merchandise_total'] for row in self.verified.values()),
                 'remaining': [{'item': item.name, 'reason': self.holds.get(item.id, reason or '담기 확인 전')}
                               for item in self.items if item.id not in completed]}

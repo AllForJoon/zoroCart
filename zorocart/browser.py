@@ -20,12 +20,13 @@ CONTROL_ACTIONS = {
     "quantity": "SET_QUANTITY",
     "add": "CLICK",
     "cart": "CLICK",
+    "clear-cart": "CLICK",
 }
 VIEW_ROLES = {
     "home": {"search-input", "search-submit", "cart"},
     "results": {"search-input", "search-submit", "card", "cart"},
     "detail": {"option", "quantity", "add", "cart"},
-    "cart": {"cart"},
+    "cart": {"cart", "clear-cart"},
 }
 FIELDS = (
     "name", "price", "pack", "capacity", "stock", "shipping", "shipping-price",
@@ -55,6 +56,10 @@ class StaleObservation(BrowserError):
 
 class AmbiguousAdd(BrowserError):
     """An attempted add must be reconciled by reading the cart before any retry."""
+
+
+class AmbiguousClear(BrowserError):
+    """An attempted reset requires a fresh read of the cart before continuing."""
 
 
 @dataclass(frozen=True)
@@ -137,6 +142,8 @@ class CoupangApproval:
     dom: dict[str, object] = field(repr=False)
     add_fields: dict[str, str] = field(repr=False)
     asset_hosts: tuple[str, ...] = ()
+    clear_path: str | None = None
+    clear_items_field: str | None = None
 
     @classmethod
     def from_file(cls, path: str | Path) -> CoupangApproval:
@@ -153,6 +160,8 @@ class CoupangApproval:
                 dom=data["dom"],
                 add_fields=data["add_fields"],
                 asset_hosts=tuple(data.get("asset_hosts", ())),
+                clear_path=data.get("clear_path"),
+                clear_items_field=data.get("clear_items_field"),
             )
             approval.validate()
         except (OSError, ValueError, KeyError, TypeError, re.error) as exc:
@@ -198,7 +207,7 @@ class CoupangApproval:
             raise ValueError("Incomplete approved add fields")
         for member, keys in (
             ("views", ("home", "results", "detail", "cart")),
-            ("controls", tuple(CONTROL_ACTIONS)),
+            ("controls", tuple(role for role in CONTROL_ACTIONS if role != "clear-cart")),
             ("fields", tuple(key for key in FIELDS if key != "capacity")),
         ):
             group = self.dom.get(member)
@@ -206,6 +215,25 @@ class CoupangApproval:
                 not isinstance(group.get(key), str) or not group[key].strip() for key in keys
             ):
                 raise ValueError("Incomplete approved DOM settings")
+        clear_selector = self.dom["controls"].get("clear-cart")
+        if self.clear_path is not None or self.clear_items_field is not None or clear_selector is not None:
+            if (
+                not isinstance(self.clear_path, str)
+                or not re.fullmatch(r"/[A-Za-z0-9/_\-.]+", self.clear_path)
+                or self.clear_path == self.add_path
+                or BLOCKED_PATH.search(self.clear_path)
+                or FORBIDDEN_PATH.search(self.clear_path)
+                or not isinstance(self.clear_items_field, str)
+                or not self.clear_items_field.strip()
+                or not isinstance(clear_selector, str)
+                or not clear_selector.strip()
+            ):
+                raise ValueError("Incomplete approved cart-clear settings")
+            row_attr = self.dom.get("clear_row_id_attr")
+            if row_attr is not None and (
+                not isinstance(row_attr, str) or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]*", row_attr)
+            ):
+                raise ValueError("Invalid approved cart row identifier attribute")
         for key in (
             "product", "variant", "cart_row", "empty", "selected",
             "key_attr", "option_attr",
@@ -276,9 +304,11 @@ SNAPSHOT = r"""
       if (role === "search-input" && !el.matches('input[type=search], input[type=text], input:not([type])')) continue;
       if (role === "quantity" && !el.matches('input[type=number], select')) continue;
       if (["card", "cart"].includes(role) && el.tagName !== "A") continue;
-      if (["search-submit", "option", "add"].includes(role) &&
+      if (["search-submit", "option", "add", "clear-cart"].includes(role) &&
           !el.matches('button, [role=button], input[type=submit]')) continue;
       if (role === "add" && !/장바구니\s*담기|장바구니에\s*담기|add\s*to\s*cart/i.test(name)) continue;
+      if (role === "clear-cart" &&
+          !/장바구니\s*(?:전체\s*)?비우기|전체\s*삭제|clear\s*(?:the\s*)?cart|empty\s*(?:the\s*)?cart/i.test(name)) continue;
       nodes.push(el);
       controls.push({
         role, key: key(el) || (role === "card" ? "" : role),
@@ -304,7 +334,9 @@ SNAPSHOT = r"""
     product_fields: fieldData(product),
   })) : [];
   const rows = view === "cart" ? find(document, cfg.cart_row).map(row => ({
-    product_id: key(row), option_id: key(row, cfg.option_attr), fields: fieldData(row),
+    product_id: key(row), option_id: key(row, cfg.option_attr),
+    clear_id: cfg.clear_row_id_attr ? key(row, cfg.clear_row_id_attr) : "",
+    fields: fieldData(row),
   })) : [];
   return {root: document.documentElement, nodes, payload: {
     view, controls, offers, rows, empty: view === "cart" && Boolean(first(document, cfg.empty)),
@@ -324,6 +356,19 @@ def _unique_fields(pairs) -> dict:
     if len(fields) != len(pairs):
         raise ValueError("Repeated write field")
     return fields
+
+
+def _same_write_field(actual: object, expected: str | list) -> bool:
+    if isinstance(expected, str):
+        return type(actual) in {str, int} and str(actual) == expected
+    if isinstance(actual, str):
+        try:
+            actual = json.loads(actual)
+        except ValueError:
+            return False
+    # Compare complete row identities regardless of order. JSON encoding also
+    # distinguishes quantity 1 from truthy booleans and keeps duplicate rows.
+    return isinstance(actual, list) and sorted(map(json.dumps, actual)) == sorted(map(json.dumps, expected))
 
 
 def _texts(fields: dict, name: str) -> tuple[str, ...]:
@@ -398,10 +443,10 @@ class BrowserAdapter:
         self._epoch = 0
         self._routing = False
         self._network_blocked = False
-        self._add_requests_left = 0
+        self._pending_path: str | None = None
         self._write_dispatched = False
         self._write_blocked = False
-        self._expected_write: dict[str, str] | None = None
+        self._expected_write: dict[str, str | list] | None = None
         self._observed_products: set[str] = set()
         self._results_url: str | None = None
         self._asset_hosts: tuple[str, ...] = ()
@@ -423,6 +468,8 @@ class BrowserAdapter:
             self._read_paths = (r"/store", r"/store/search", r"/store/cart", r"/store/product/[\w-]+")
             self._add_path = "/store/cart/add"
             self._add_fields = {"product": "product", "option": "option", "quantity": "quantity"}
+            self._clear_path = "/store/cart/clear"
+            self._clear_items_field = "cart"
             self._dom = LOCAL_DOM
         elif mode == "coupang" and approval:
             if not isinstance(approval, CoupangApproval):
@@ -438,6 +485,8 @@ class BrowserAdapter:
             self._read_paths = approval.read_paths
             self._add_path = approval.add_path
             self._add_fields = approval.add_fields
+            self._clear_path = approval.clear_path
+            self._clear_items_field = approval.clear_items_field
             self._dom = approval.dom
             self._asset_hosts = approval.asset_hosts
         else:
@@ -459,24 +508,23 @@ class BrowserAdapter:
         except ValueError:
             return False
 
-    def _is_add_url(self, url: str) -> bool:
+    def _is_write_url(self, url: str, path: str) -> bool:
         parsed = urlsplit(url)
         return (
             _origin(parsed) == self._shop_origin
-            and parsed.path == self._add_path
+            and parsed.path == path
             and not (parsed.username or parsed.password or parsed.query or parsed.fragment)
         )
 
     async def _route(self, route: Route) -> None:
         request = route.request
         url = request.url
-        if request.method == "POST" and self._add_requests_left and self._is_add_url(url):
+        if request.method == "POST" and self._pending_path and self._is_write_url(url, self._pending_path):
+            self._pending_path = None
             if not self._correct_write(request.post_data, request.headers.get("content-type", "")):
                 self._write_blocked = True
-                self._add_requests_left = 0
                 await route.abort()
                 return
-            self._add_requests_left -= 1
             self._write_dispatched = True
             if self.mode == "coupang":
                 # Inspect the approved write response without following method-preserving redirects.
@@ -531,10 +579,7 @@ class BrowserAdapter:
         return (
             self._expected_write is not None
             and isinstance(data, dict)
-            and all(
-                type(data.get(key)) in {str, int} and str(data[key]) == value
-                for key, value in self._expected_write.items()
-            )
+            and all(_same_write_field(data.get(key), value) for key, value in self._expected_write.items())
         )
 
     @property
@@ -602,7 +647,7 @@ class BrowserAdapter:
         await self._goto(self.home_url)
 
     async def open_cart(self) -> None:
-        """Use the scoped cart read URL after an uncertain add."""
+        """Use the scoped cart read URL to reconcile a cart mutation."""
         await self._goto(self.cart_url, recovery=self._write_dispatched)
 
     async def open_product(self, url: str) -> None:
@@ -745,8 +790,11 @@ class BrowserAdapter:
         return self._offers(data)
 
     async def read_cart(self) -> tuple[CartLine, ...]:
-        data = await self._read()
-        if data["view"] != "cart" or (not data["rows"] and not data["empty"]):
+        return self._cart_lines(await self._read())
+
+    @staticmethod
+    def _cart_lines(data: dict) -> tuple[CartLine, ...]:
+        if data["view"] != "cart" or bool(data["rows"]) == data["empty"]:
             raise BrowserError("장바구니 상품과 빈 장바구니 여부를 확인할 수 없습니다.")
         lines: list[CartLine] = []
         for row in data["rows"]:
@@ -777,6 +825,7 @@ class BrowserAdapter:
         *,
         expected_offer: Offer | None = None,
         expected_quantity: int | None = None,
+        expected_cart: tuple[CartLine, ...] | None = None,
     ) -> None:
         if observation is not self._active or self.page.url != self._observation_url:
             raise StaleObservation("이 결정은 현재 화면의 관찰 결과에 속하지 않습니다.")
@@ -806,7 +855,7 @@ class BrowserAdapter:
         target = next((item for item in observation.targets if item.id == target_id), None)
         if not target or target.action != action:
             raise StaleObservation("관찰 ID와 선택한 동작이 일치하지 않습니다.")
-        self._step(before_add=target.role == "add")
+        self._step(before_add=target.role in {"add", "clear-cart"})
         node = self._nodes.get(target.id)
         try:
             active = node and await node.evaluate("""(el) => el.isConnected &&
@@ -819,6 +868,9 @@ class BrowserAdapter:
         if target.role == "add":
             self._require_add_evidence(current, expected_offer, expected_quantity)
             await self._add(node, expected_offer, expected_quantity)
+            return
+        if target.role == "clear-cart":
+            await self._clear(node, current, expected_cart)
             return
         try:
             if action == "TYPE_TEXT":
@@ -871,6 +923,45 @@ class BrowserAdapter:
             raise StaleObservation("추가 직전 상품·옵션·수량·가격을 다시 확인해야 합니다.")
 
     async def _add(self, node: ElementHandle, offer: Offer, quantity: int) -> None:
+        expected = {
+            self._add_fields["product"]: offer.product_id,
+            self._add_fields["option"]: offer.option_id,
+            self._add_fields["quantity"]: str(quantity),
+        }
+        await self._submit_write(node, self._add_path, expected)
+
+    async def _clear(
+        self, node: ElementHandle, data: dict, expected: tuple[CartLine, ...] | None,
+    ) -> None:
+        if self._clear_path is None or self._clear_items_field is None:
+            raise BrowserBlocked("승인 범위에서 장바구니 비우기를 확인할 수 없습니다.")
+        lines = self._cart_lines(data)
+        identities = {(line.product_id, line.option_id) for line in lines}
+        if (
+            not expected
+            or len(identities) != len(lines)
+            or len(expected) != len(lines)
+            or frozenset(expected) != frozenset(lines)
+        ):
+            raise StaleObservation("장바구니가 바뀌어 비우기 대상을 확인할 수 없습니다.")
+        if self._dom.get("clear_row_id_attr"):
+            payload = [row["clear_id"] for row in data["rows"]]
+            if len(payload) != len(set(payload)) or not all(SAFE_KEY.fullmatch(key) for key in payload):
+                raise BrowserBlocked("장바구니 비우기 요청에 사용할 행 ID를 확인할 수 없습니다.")
+        else:
+            payload = [[line.product_id, line.option_id, line.quantity] for line in lines]
+        await self._submit_write(
+            node, self._clear_path, {self._clear_items_field: payload}, clearing=True,
+        )
+
+    async def _submit_write(
+        self,
+        node: ElementHandle,
+        path: str,
+        expected: dict[str, str | list],
+        *,
+        clearing: bool = False,
+    ) -> None:
         self._require_current_url()
         form = await node.evaluate(r"""(el) => ({
             action: el.form ? (el.getAttribute("formaction") ? el.formAction : el.form.action) : null,
@@ -880,21 +971,18 @@ class BrowserAdapter:
         if (
             form["target"] not in {"", "_self"}
             or (form["action"] and (
-                not self._is_add_url(form["action"]) or form["method"].lower() != "post"
+                not self._is_write_url(form["action"], path) or form["method"].lower() != "post"
             ))
         ):
-            raise BrowserBlocked("장바구니 추가 요청이 승인 범위와 다릅니다.")
+            raise BrowserBlocked("장바구니 변경 요청이 승인 범위와 다릅니다.")
+        ambiguous = AmbiguousClear if clearing else AmbiguousAdd
         self._write_dispatched = False
         self._write_blocked = False
-        self._expected_write = {
-            self._add_fields["product"]: offer.product_id,
-            self._add_fields["option"]: offer.option_id,
-            self._add_fields["quantity"]: str(quantity),
-        }
-        self._add_requests_left = 1
+        self._expected_write = expected
+        self._pending_path = path
         try:
             async with self.page.expect_response(
-                lambda response: response.request.method == "POST" and self._is_add_url(response.url),
+                lambda response: response.request.method == "POST" and self._is_write_url(response.url, path),
                 timeout=self.action_timeout_ms,
             ) as response_info:
                 await node.click(timeout=self.action_timeout_ms)
@@ -903,15 +991,20 @@ class BrowserAdapter:
                 self._network_blocked = True
                 raise BrowserBlocked("상점에서 로그인 또는 접근 제한을 알렸습니다.")
             if response.status >= 400:
-                raise AmbiguousAdd("상점 응답을 장바구니에서 다시 확인해야 합니다.")
+                raise ambiguous("상점 응답을 장바구니에서 다시 확인해야 합니다.")
             await self.page.wait_for_load_state("domcontentloaded", timeout=self.action_timeout_ms)
+            if self._is_write_url(self.page.url, path) and not self._network_blocked:
+                raise ambiguous("변경 반영 여부를 장바구니에서 먼저 확인해야 합니다.")
             self._require_current_url()
         except PlaywrightError as exc:
             if self._write_blocked:
-                raise BrowserBlocked("장바구니 요청의 상품·옵션·수량이 확인 결과와 다릅니다.") from exc
+                message = "장바구니 비우기 요청의 삭제 대상이 확인 결과와 다릅니다." if clearing else (
+                    "장바구니 요청의 상품·옵션·수량이 확인 결과와 다릅니다."
+                )
+                raise BrowserBlocked(message) from exc
             if self._network_blocked:
                 raise BrowserBlocked("로그인 또는 승인 범위 밖으로 이동이 감지됐습니다.") from exc
-            raise AmbiguousAdd("담기 반영 여부를 장바구니에서 먼저 확인해야 합니다.") from exc
+            raise ambiguous("변경 반영 여부를 장바구니에서 먼저 확인해야 합니다.") from exc
         finally:
-            self._add_requests_left = 0
+            self._pending_path = None
             self._expected_write = None
